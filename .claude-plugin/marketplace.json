@@ -1,0 +1,14 @@
+{
+  "name": "claude-mod-limits-left",
+  "owner": { "name": "Gidedin", "url": "https://github.com/imgidedin" },
+  "metadata": { "description": "The limits-left mod for Claude Code." },
+  "plugins": [
+    {
+      "name": "limits-left",
+      "source": "./",
+      "description": "Mod: what is left of the 5-hour and weekly limits in the prompt footer, with usage pace and a warning before one runs out.",
+      "version": "1.0.0",
+      "category": "mod"
+    }
+  ]
+}

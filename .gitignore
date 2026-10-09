@@ -1,0 +1,5 @@
+.DS_Store
+node_modules/
+# Generated per machine by Claude Code
+.claude-plugin/types/
+tsconfig.json
