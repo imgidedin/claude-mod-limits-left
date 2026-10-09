@@ -245,6 +245,15 @@ export const isOverPace = (kind: string, window: LimitWindow, at: number): boole
 }
 
 const TITLES: Record<string, string> = { five_hour: 'Limite de sessão · 5h', seven_day: 'Semanal · 7d' }
+// How long the warning's toast stays up.
+const WARNING_MS = 10_000
+
+const SHORT_TITLES: Record<string, string> = { five_hour: '5h', seven_day: '7d' }
+
+// What the toast says when a reading puts a window over its pace; the app puts the mod's name
+// before it, so it is kept short.
+export const warning = (kind: string, window: LimitWindow, at: number): string =>
+  `${SHORT_TITLES[kind] ?? kind} acima do ritmo · ${forecast(window, at)}`
 const SPAN_TITLES = ['Últimos 15 min', 'Últimos 30 min', 'Última hora'] as const
 
 const usedOf = (window: LimitWindow): number => round1(100 - left(window))
@@ -468,11 +477,18 @@ export const register: Register = on => {
     const spent = await $.store.get(SPEND_KEY)
     const counted: Spend = isSpend(spent) ? spent : NO_SPEND
     let turned = counted
+    const warnings: string[] = []
 
     for (const limit of fresh) {
-      const before = held[limit.kind]?.samples.at(-1)?.used
-      const samples = record(held[limit.kind]?.samples ?? [], t, limit.percentUsed)
-      merged[limit.kind] = limit.resetsAt === undefined ? { samples } : { samples, resetsAt: limit.resetsAt }
+      const known = held[limit.kind]
+      const before = known?.samples.at(-1)?.used
+      const samples = record(known?.samples ?? [], t, limit.percentUsed)
+      const window = limit.resetsAt === undefined ? { samples } : { samples, resetsAt: limit.resetsAt }
+      merged[limit.kind] = window
+      // Said once, by the reading that crosses the line: the store is shared, so the other
+      // sessions find the window already over its pace and stay quiet.
+      const wasOverPace = known !== undefined && isOverPace(limit.kind, known, t)
+      if (!wasOverPace && isOverPace(limit.kind, window, t)) warnings.push(warning(limit.kind, window, t))
       // A reading a little under the last is another session's older one, as `record` has it.
       const isOlder = before !== undefined && limit.percentUsed < before && limit.percentUsed >= before - 1
       if (before !== undefined && !isOlder) turned = turnPoint(turned, limit.kind, before, limit.percentUsed)
@@ -485,6 +501,7 @@ export const register: Register = on => {
       await update($, spend, () => turned)
       await update($, now, () => t)
     }
+    for (const text of warnings) void $.ui.toast(text, { timeoutMs: WARNING_MS })
 
     return next(e)
   })

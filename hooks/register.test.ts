@@ -292,3 +292,29 @@ test('a turn that ends goes on the count the sessions share', async ($, on) => {
   expect(drawn).toContain('~67.3%')
   expect(drawn).toContain('~1.3% · 1.3k')
 })
+
+test('toasts once when a reading puts a window over its pace', async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  mock.store(on)
+  const toasts: string[] = []
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('ui.toast', (_, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  const resetsAt = (minutes: number) => new Date(clock.now() + minutes * MINUTE).toISOString()
+
+  await measure($, [{ kind: 'five_hour', percentUsed: 10, resetsAt: resetsAt(300) }])
+  expect(toasts).toEqual([])
+
+  // 30 points in the hour, 60 left: out in two hours, with four to the reset.
+  await clock.advance(60 * MINUTE)
+  await measure($, [{ kind: 'five_hour', percentUsed: 40, resetsAt: resetsAt(240) }])
+  expect(toasts).toEqual(['5h acima do ritmo · esgota em ~2h00'])
+
+  // Still over it a minute later: nothing more to say.
+  await clock.advance(MINUTE)
+  await measure($, [{ kind: 'five_hour', percentUsed: 41, resetsAt: resetsAt(239) }])
+  expect(toasts.length).toBe(1)
+})
