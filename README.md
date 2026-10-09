@@ -92,7 +92,9 @@ O limite de 15 pontos por dia existe para sobrar cota até o fim da semana: uma 
 
 <div align="center">
 
-<img src="docs/card-over-pace.svg" alt="Cartão da janela de 5 horas acima do ritmo: 78% usado, esgota em cerca de 51 minutos" width="300">
+<img src="docs/over-pace.svg" alt="Janela de 5 horas acima do ritmo: o Claude em pânico ao lado dos cartões, o cartão de 5 horas dizendo que a cota esgota em cerca de 51 minutos, e no rodapé um sinal de pare ao lado dos 22% que restam" width="770">
+
+<sub>A janela de 5 horas acima do ritmo: o 🛑 no rodapé, o Claude em pânico ao lado dos cartões e a estimativa em vermelho.</sub>
 
 </div>
 
