@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderElement, RenderInput, SessionRateLimit } from 'claude-code'
+import type { EngineInterface, ModelUsage, Register, RenderElement, RenderInput, SessionRateLimit } from 'claude-code'
 
-import type { LimitWindow, Sample, Windows } from '../types'
+import type { LimitWindow, Sample, Spend, Windows } from '../types'
 
 // Left to right: the 5-hour window, then the weekly one.
 const KINDS = ['five_hour', 'seven_day'] as const
@@ -18,6 +18,14 @@ const SPANS = [
 // The shortest stretch of history a pace is estimated from.
 const MIN_PACE_MS = 5 * MINUTE
 const STORE_KEY = 'windows'
+// Its own key: a session still running the mod as it was reads windows alone and keeps it whole.
+const SPEND_KEY = 'spend'
+// A reading is a whole number, so the turns never fill in more than the point it is in.
+const MAX_FRACTION = 0.9
+// What a token costs beside an uncached input one, as the API prices them.
+const OUTPUT_WEIGHT = 5
+const CACHE_WRITE_WEIGHT = 1.25
+const CACHE_READ_WEIGHT = 0.1
 const EARLY_MS = 30 * MINUTE
 const WEEKLY_POINTS_A_DAY = 15
 
@@ -69,6 +77,8 @@ const now = atom({ plugin: 'limits-left', key: 'now' } as const, 0)
 // Whether the cards are up in the band above the prompt: a press on either footer button
 // flips it, and so does /limits.
 const isOpen = atom({ plugin: 'limits-left', key: 'isOpen' } as const, false)
+export const NO_SPEND: Spend = { total: 0, events: [], marks: {}, perPoint: {} }
+const spend = atom({ plugin: 'limits-left', key: 'spend' } as const, NO_SPEND)
 // The desktop's button has no padding of its own and takes none: no-break spaces stand in.
 const PAD = '\u00A0\u00A0'
 const COMMAND = 'limits'
@@ -136,6 +146,64 @@ const pace = (samples: readonly Sample[], at: number): number | undefined => {
 
 const left = (window: LimitWindow): number => Math.max(0, 100 - (window.samples.at(-1)?.used ?? 0))
 
+// Adds a turn to the count, keeping one entry a minute and the last hour of them.
+export const spendTurn = (held: Spend, t: number, usage: ModelUsage): Spend => {
+  // Shown without what the cache served: every step reads the whole conversation back from it.
+  const tokens = usage.input_tokens + usage.output_tokens + usage.cache_creation_input_tokens
+  const weight =
+    usage.input_tokens +
+    usage.output_tokens * OUTPUT_WEIGHT +
+    usage.cache_creation_input_tokens * CACHE_WRITE_WEIGHT +
+    usage.cache_read_input_tokens * CACHE_READ_WEIGHT
+  const recent = held.events.filter(event => event.t > t - HOUR)
+  const last = recent.at(-1)
+  const events =
+    last !== undefined && t - last.t < MINUTE
+      ? [...recent.slice(0, -1), { t: last.t, tokens: last.tokens + tokens, weight: last.weight + weight }]
+      : [...recent, { t, tokens, weight }]
+
+  return { ...held, total: held.total + weight, events }
+}
+
+// A window's reading went from one whole number to another: up, the turns since the last
+// time say what a point takes, and the count starts again; down, the window reset.
+export const turnPoint = (held: Spend, kind: string, from: number, to: number): Spend => {
+  const { [kind]: mark, ...otherMarks } = held.marks
+  if (to < from) return { ...held, marks: otherMarks }
+  if (to === from) return held
+
+  const marks = { ...held.marks, [kind]: held.total }
+  const measured = mark === undefined ? 0 : (held.total - mark) / (to - from)
+  if (measured <= 0) return { ...held, marks }
+
+  const known = held.perPoint[kind]
+
+  return { ...held, marks, perPoint: { ...held.perPoint, [kind]: known === undefined ? measured : (known + measured) / 2 } }
+}
+
+// How far into its current point the turns since it began put a window; undefined until a
+// point was seen from one end to the other.
+export const fraction = (held: Spend, kind: string): number | undefined => {
+  const mark = held.marks[kind]
+  const perPoint = held.perPoint[kind]
+  if (mark === undefined || perPoint === undefined) return undefined
+
+  return Math.min(MAX_FRACTION, Math.floor(((held.total - mark) / perPoint) * 10) / 10)
+}
+
+const spentIn = (held: Spend, at: number, span: number): { tokens: number; weight: number } =>
+  held.events
+    .filter(event => event.t > at - span)
+    .reduce((sum, event) => ({ tokens: sum.tokens + event.tokens, weight: sum.weight + event.weight }), { tokens: 0, weight: 0 })
+
+const compact = (tokens: number): string => {
+  if (tokens < 1000) return String(tokens)
+  if (tokens < 100_000) return `${round1(tokens / 1000)}k`
+  if (tokens < 1_000_000) return `${Math.round(tokens / 1000)}k`
+
+  return `${round1(tokens / 1_000_000)}M`
+}
+
 const resetsIn = (window: LimitWindow, at: number): number =>
   window.resetsAt === undefined ? Number.NaN : Date.parse(window.resetsAt) - at
 
@@ -181,30 +249,53 @@ const SPAN_TITLES = ['Últimos 15 min', 'Últimos 30 min', 'Última hora'] as co
 
 const usedOf = (window: LimitWindow): number => round1(100 - left(window))
 
+// What is used with the turns' fraction of the current point on it, marked as the estimate it is.
+const usedLabel = (kind: string, window: LimitWindow, held: Spend): string => {
+  const part = fraction(held, kind)
+
+  return part === undefined ? `${usedOf(window)}%` : `~${round1(usedOf(window) + part)}%`
+}
+
 const resetLine = (window: LimitWindow, at: number): string => {
   const untilReset = resetsIn(window, at)
 
   return untilReset > 0 ? `Reinicia em ${duration(untilReset)}` : ''
 }
 
-// The spans' figures, in SPANS' order: `1.2%`, or a dash where the history does not reach.
-const spanFigures = (window: LimitWindow, at: number): string[] =>
+// The spans' figures, in SPANS' order: the points of the window and, once a turn is on record,
+// the tokens (`~0.4% · 182k`). The points are the turns' estimate where a point's weight is
+// known, the readings' otherwise: a dash where the history does not reach, and `<1%` where
+// tokens went and the whole-number reading did not move.
+const spanFigures = (kind: string, window: LimitWindow, at: number, held: Spend): string[] =>
   SPANS.map(({ ms }) => {
+    const { tokens, weight } = spentIn(held, at, ms)
+    const perPoint = held.perPoint[kind]
     const used = usedIn(window.samples, at, ms)
+    const points =
+      perPoint !== undefined
+        ? `~${round1(weight / perPoint)}%`
+        : used === undefined
+          ? '–'
+          : used === 0 && tokens > 0
+            ? '<1%'
+            : `${used}%`
 
-    return used === undefined ? '–' : `${used}%`
+    return held.total === 0 ? points : `${points} · ${compact(tokens)}`
   })
 
 // One line of it all, for a reader that cannot see the card.
-export const details = (kind: string, window: LimitWindow, at: number): string =>
+export const details = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): string =>
   [
-    `${TITLES[kind] ?? kind}: ${usedOf(window)}% usado`,
+    `${TITLES[kind] ?? kind}: ${usedLabel(kind, window, held)} usado`,
     resetLine(window, at),
-    ...spanFigures(window, at).map((figure, i) => `${SPANS[i]?.label} ${figure}`),
+    ...spanFigures(kind, window, at, held).map((figure, i) => `${SPANS[i]?.label} ${figure}`),
     forecast(window, at),
   ]
     .filter(part => part !== '')
     .join(' · ')
+
+// A figure such as `<1%` is text in the card's markup, not a tag.
+const escapeXml = (text: string): string => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
 const CARD_W = 300
 const CARD_H = 150
@@ -218,14 +309,15 @@ text{font-family:${FONT};font-size:12px}
 
 // The card a hover shows on a surface that draws pixels: the window as the app's own usage
 // card has it, then what the last 15 minutes, 30 minutes and hour took, and where that leads.
-export const cardSvg = (kind: string, window: LimitWindow, at: number): string => {
+export const cardSvg = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): string => {
   const right = CARD_W - 14
   const o = outlook(window, at)
-  const rows = spanFigures(window, at)
+  const used = Math.min(100, usedOf(window) + (fraction(held, kind) ?? 0))
+  const rows = spanFigures(kind, window, at, held)
     .map((figure, i) => {
       const y = 68 + i * 20
 
-      return `<text class="s" x="14" y="${y}">${SPAN_TITLES[i]}</text><text class="t" x="${right}" y="${y}" text-anchor="end">${figure}</text>`
+      return `<text class="s" x="14" y="${y}">${SPAN_TITLES[i]}</text><text class="t" x="${right}" y="${y}" text-anchor="end">${escapeXml(figure)}</text>`
     })
     .join('')
   // Fine is a green check and nothing to read.
@@ -239,9 +331,9 @@ export const cardSvg = (kind: string, window: LimitWindow, at: number): string =
     CARD_CSS,
     `<rect class="bg" x=".5" y=".5" width="${CARD_W - 1}" height="${CARD_H - 1}" rx="10"/>`,
     `<text class="t" x="14" y="24" font-weight="600">${TITLES[kind] ?? kind}</text>`,
-    `<text x="${right}" y="24" text-anchor="end"><tspan class="s">${resetLine(window, at)}  </tspan><tspan class="t">${usedOf(window)}%</tspan></text>`,
+    `<text x="${right}" y="24" text-anchor="end"><tspan class="s">${resetLine(window, at)}  </tspan><tspan class="t">${usedLabel(kind, window, held)}</tspan></text>`,
     `<rect class="k" x="14" y="34" width="${CARD_W - 28}" height="4" rx="2"/>`,
-    `<rect class="bar" x="14" y="34" width="${round1(((CARD_W - 28) * usedOf(window)) / 100)}" height="4" rx="2"/>`,
+    `<rect class="bar" x="14" y="34" width="${round1(((CARD_W - 28) * used) / 100)}" height="4" rx="2"/>`,
     rows,
     `<line class="ln" x1="14" y1="118" x2="${right}" y2="118"/>`,
     `<text class="s" x="14" y="136">No ritmo atual</text>`,
@@ -249,6 +341,14 @@ export const cardSvg = (kind: string, window: LimitWindow, at: number): string =
     '</svg>',
   ].join('')
 }
+
+const isSpend = (value: unknown): value is Spend =>
+  typeof value === 'object' &&
+  value !== null &&
+  typeof (value as Spend).total === 'number' &&
+  Array.isArray((value as Spend).events) &&
+  typeof (value as Spend).marks === 'object' &&
+  typeof (value as Spend).perPoint === 'object'
 
 const isWindows = (value: unknown): value is Windows =>
   typeof value === 'object' &&
@@ -270,7 +370,7 @@ const ICONS: Record<string, { emoji: string; glyph: string }> = {
 type Shown = { kind: string; window: LimitWindow; left: number }
 
 // The windows there is a reading of, in KINDS' order, and the time they are read at.
-const gather = async ($: EngineInterface): Promise<{ shown: Shown[]; at: number }> => {
+const gather = async ($: EngineInterface): Promise<{ shown: Shown[]; at: number; held: Spend }> => {
   const held = await read($, windows)
   const at = await read($, now)
   const shown = KINDS.flatMap(kind => {
@@ -279,7 +379,7 @@ const gather = async ($: EngineInterface): Promise<{ shown: Shown[]; at: number 
     return window === undefined || window.samples.length === 0 ? [] : [{ kind, window, left: Math.round(left(window)) }]
   })
 
-  return { shown, at }
+  return { shown, at, held: await read($, spend) }
 }
 
 // One window in the footer: its icon, what is left of it, and a mark where it is over pace.
@@ -293,7 +393,7 @@ export const footerLabel = ({ kind, window, left }: Shown, at: number, isTermina
 // The cards, one per window, with him beside them while a window is over pace. They keep to
 // the band's right end, over the footer's buttons that put them up.
 const drawCards = async ($: EngineInterface, e: RenderInput): Promise<RenderElement | undefined> => {
-  const { shown, at } = await gather($)
+  const { shown, at, held } = await gather($)
   if (shown.length === 0) return undefined
 
   const ui = $.ui.resolve(e)
@@ -311,15 +411,15 @@ const drawCards = async ($: EngineInterface, e: RenderInput): Promise<RenderElem
       )}
       {shown.map(({ kind, window }) =>
         hasPixels ? (
-          <ui.Svg key={kind} source={cardSvg(kind, window, at)} alt={details(kind, window, at)} width={CARD_W} height={CARD_H} />
+          <ui.Svg key={kind} source={cardSvg(kind, window, at, held)} alt={details(kind, window, at, held)} width={CARD_W} height={CARD_H} />
         ) : (
           <Box key={kind} flexDirection="column" width={40} borderStyle="round" paddingX={1}>
             <Box justifyContent="space-between">
               <Text bold>{TITLES[kind] ?? kind}</Text>
-              <Text>{usedOf(window)}%</Text>
+              <Text>{usedLabel(kind, window, held)}</Text>
             </Box>
             <Text dimColor>{resetLine(window, at)}</Text>
-            {spanFigures(window, at).map((figure, i) => (
+            {spanFigures(kind, window, at, held).map((figure, i) => (
               <Box justifyContent="space-between">
                 <Text dimColor>{SPAN_TITLES[i]}</Text>
                 <Text>{figure}</Text>
@@ -342,6 +442,8 @@ export const register: Register = on => {
     const started = await next(e)
     const stored = await $.store.get(STORE_KEY)
     await update($, windows, () => (isWindows(stored) ? stored : {}))
+    const spent = await $.store.get(SPEND_KEY)
+    await update($, spend, () => (isSpend(spent) ? spent : NO_SPEND))
     const t = await $.clock.now()
     await update($, now, () => t)
     await $.command.register({
@@ -363,15 +465,38 @@ export const register: Register = on => {
     const held: Windows = isWindows(stored) ? stored : {}
     const fresh = e.rateLimits.filter((l: SessionRateLimit) => KINDS.some(kind => kind === l.kind))
     const merged: Windows = { ...held }
+    const spent = await $.store.get(SPEND_KEY)
+    const counted: Spend = isSpend(spent) ? spent : NO_SPEND
+    let turned = counted
 
     for (const limit of fresh) {
+      const before = held[limit.kind]?.samples.at(-1)?.used
       const samples = record(held[limit.kind]?.samples ?? [], t, limit.percentUsed)
       merged[limit.kind] = limit.resetsAt === undefined ? { samples } : { samples, resetsAt: limit.resetsAt }
+      // A reading a little under the last is another session's older one, as `record` has it.
+      const isOlder = before !== undefined && limit.percentUsed < before && limit.percentUsed >= before - 1
+      if (before !== undefined && !isOlder) turned = turnPoint(turned, limit.kind, before, limit.percentUsed)
     }
 
     if (fresh.length > 0) {
       await $.store.set(STORE_KEY, merged)
+      if (turned !== counted) await $.store.set(SPEND_KEY, turned)
       await update($, windows, () => merged)
+      await update($, spend, () => turned)
+      await update($, now, () => t)
+    }
+
+    return next(e)
+  })
+
+  // Every turn's tokens, a subagent's run included, go on the count the sessions share.
+  on('turn.complete', async ($, e, next) => {
+    if (e.usage !== undefined) {
+      const t = await $.clock.now()
+      const spent = await $.store.get(SPEND_KEY)
+      const counted = spendTurn(isSpend(spent) ? spent : NO_SPEND, t, e.usage)
+      await $.store.set(SPEND_KEY, counted)
+      await update($, spend, () => counted)
       await update($, now, () => t)
     }
 

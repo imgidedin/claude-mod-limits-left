@@ -7,7 +7,7 @@
       "name": "limits-left",
       "source": "./",
       "description": "Mod: what is left of the 5-hour and weekly limits in the prompt footer, with usage pace and a warning before one runs out.",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "category": "mod"
     }
   ]

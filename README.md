@@ -17,14 +17,15 @@ acompanha o seu ritmo de consumo e avisa antes de você ficar sem cota.
 
 - **Mostra o que resta, não o que foi gasto.** No rodapé do prompt, ao lado do seletor de modelo: `🕐 61%` para a janela de 5 horas e `📅 34%` para a semanal.
 - **Guarda o histórico de consumo.** Uma amostra por minuto de cada janela, compartilhada entre todas as suas sessões e mantida entre reinícios.
-- **Calcula o seu ritmo.** Quanto você usou nos últimos 15 minutos, 30 minutos e na última hora, e se nesse ritmo a cota acaba antes do reset.
+- **Calcula o seu ritmo.** Quanto você usou nos últimos 15 minutos, 30 minutos e na última hora, em pontos da janela e em tokens, e se nesse ritmo a cota acaba antes do reset.
+- **Estima a casa decimal.** As leituras chegam em pontos inteiros; o mod conta os tokens dos seus turnos para estimar onde você está dentro do ponto atual (`~66.4%`).
 - **Avisa quando o ritmo está alto demais.** Um `🛑` aparece ao lado da janela em risco, e o Claude em pânico aparece junto dos cartões.
 
 <div align="center">
 
-<img src="docs/card-5h.svg" alt="Cartão da janela de 5 horas: 40% usado, reinicia em 51 minutos, ritmo ok" width="300">
+<img src="docs/card-5h.svg" alt="Cartão da janela de 5 horas: cerca de 40,4% usado, reinicia em 51 minutos, 42 mil tokens nos últimos 15 minutos, ritmo ok" width="300">
 &nbsp;
-<img src="docs/card-7d.svg" alt="Cartão da janela semanal: 66% usado, reinicia em 18h51, ritmo ok" width="300">
+<img src="docs/card-7d.svg" alt="Cartão da janela semanal: cerca de 66,4% usado, reinicia em 18h51, 42 mil tokens nos últimos 15 minutos, ritmo ok" width="300">
 
 </div>
 
@@ -77,8 +78,8 @@ No terminal, o rodapé é uma linha de texto (`◷ 61% · ▦ 34%`) e os cartõe
 
 ### O que cada cartão mostra
 
-- **Cabeçalho:** a janela, quanto falta para reiniciar e o percentual já usado, com a barra de progresso.
-- **Últimos 15 min, 30 min e última hora:** quantos pontos percentuais da janela foram consumidos em cada período. Um traço (`–`) significa que o histórico ainda não cobre aquele período.
+- **Cabeçalho:** a janela, quanto falta para reiniciar e o percentual já usado, com a barra de progresso. Um `~` na frente marca uma estimativa.
+- **Últimos 15 min, 30 min e última hora:** quantos pontos percentuais da janela foram consumidos em cada período e quantos tokens os seus turnos gastaram nele (`~0.4% · 42k`). Um traço (`–`) significa que o histórico ainda não cobre aquele período, e `<1%` que houve tokens mas a leitura ainda não virou um ponto.
 - **No ritmo atual:** um ✓ verde se a cota aguenta até o reset, ou `esgota em ~2h00` em vermelho se não aguenta.
 
 ### Quando o aviso aparece
@@ -92,7 +93,7 @@ O limite de 15 pontos por dia existe para sobrar cota até o fim da semana: uma 
 
 <div align="center">
 
-<img src="docs/over-pace.svg" alt="Janela de 5 horas acima do ritmo: o Claude em pânico ao lado dos cartões, o cartão de 5 horas dizendo que a cota esgota em cerca de 51 minutos, e no rodapé um sinal de pare ao lado dos 22% que restam" width="770">
+<img src="docs/over-pace.svg" alt="Janela de 5 horas acima do ritmo: o Claude em pânico ao lado dos cartões, o cartão de 5 horas com o consumo em pontos e em tokens, dizendo que a cota esgota em cerca de 51 minutos, e no rodapé um sinal de pare ao lado dos 22% que restam" width="770">
 
 <sub>A janela de 5 horas acima do ritmo: o 🛑 no rodapé, o Claude em pânico ao lado dos cartões e a estimativa em vermelho.</sub>
 
@@ -107,7 +108,16 @@ A cada resposta do modelo, o Claude Code informa quanto de cada janela já foi u
 - **Reset da janela:** quando o percentual usado cai, o histórico daquela janela recomeça do zero.
 - **Onde fica guardado:** no armazenamento do próprio mod, dentro da pasta de configuração do Claude Code. Nada sai da sua máquina; o mod não faz nenhuma chamada de rede.
 
-As leituras chegam em pontos inteiros. Na janela de 7 dias isso deixa o ritmo de curto prazo granulado: um único ponto na última hora já equivale a 24 pontos por dia. Por isso o aviso semanal exige também que a cota acabe antes do reset.
+### A estimativa entre dois pontos
+
+As leituras chegam em pontos inteiros, então sozinhas elas não dizem quanto você gastou enquanto o número não vira. Para preencher esse intervalo, o mod soma os tokens de cada turno, incluindo os de subagentes, numa contagem compartilhada entre as sessões.
+
+- **Calibração:** cada vez que a leitura de uma janela sobe um ponto, o mod mede quantos tokens couberam naquele ponto. A estimativa só aparece depois de ele presenciar um ponto inteiro, do começo ao fim.
+- **Peso dos tokens:** para o percentual, cada tipo de token pesa conforme o preço: saída 5×, escrita de cache 1,25× e leitura de cache 0,1×, em relação à entrada. A diferença de preço entre modelos não entra na conta.
+- **Tokens exibidos:** entrada, saída e escrita de cache. A leitura de cache fica de fora, porque cada passo relê a conversa inteira e o número deixaria de dizer algo.
+- **Limite do erro:** a estimativa nunca passa de 0,9 dentro do ponto atual e é corrigida a cada virada. Uso fora das sessões com o mod (o chat do claude.ai, outras máquinas) não é contado, e faz o ponto virar antes do previsto.
+
+O ritmo e o aviso continuam vindo só das leituras inteiras. Na janela de 7 dias isso deixa o ritmo de curto prazo granulado: um único ponto na última hora já equivale a 24 pontos por dia. Por isso o aviso semanal exige também que a cota acabe antes do reset.
 
 ## Limitações conhecidas
 

@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { cardSvg, details, forecast, isOverPace, record, usedIn } from './register'
+import { NO_SPEND, cardSvg, details, forecast, fraction, isOverPace, record, spendTurn, turnPoint, usedIn } from './register'
 
 const MINUTE = 60_000
 const EMPTY = { type: 'Box' } as const
@@ -206,4 +206,89 @@ test('passes while there is no reading', async ($, on) => {
   const footer = await $.ui.mount({ plugin: 'limits-left', surface: 'terminal', component: 'SessionMode', props: { modes: [] } })
 
   expect(await footer.drawn()).toEqual(EMPTY)
+})
+
+const usage = (input: number, output = 0, cacheRead = 0) => ({
+  input_tokens: input,
+  output_tokens: output,
+  cache_read_input_tokens: cacheRead,
+  cache_creation_input_tokens: 0,
+})
+
+test('the turns say where a window is inside a point once a whole point was seen', () => {
+  // The reading turns to 66, 1000 of weight go by, and it turns to 67: a point takes 1000.
+  let spend = turnPoint(NO_SPEND, 'seven_day', 65, 66)
+  expect(fraction(spend, 'seven_day')).toBe(undefined)
+
+  spend = spendTurn(spend, START, usage(500, 100))
+  spend = turnPoint(spend, 'seven_day', 66, 67)
+  expect(spend.perPoint.seven_day).toBe(1000)
+  expect(fraction(spend, 'seven_day')).toBe(0)
+
+  spend = spendTurn(spend, START + 5 * MINUTE, usage(450))
+  expect(fraction(spend, 'seven_day')).toBe(0.4)
+
+  // Never past the point the reading is in, whatever went by outside this count.
+  spend = spendTurn(spend, START + 6 * MINUTE, usage(5000))
+  expect(fraction(spend, 'seven_day')).toBe(0.9)
+
+  // A reset takes the mark and keeps what a point takes.
+  spend = turnPoint(spend, 'seven_day', 67, 0)
+  expect(fraction(spend, 'seven_day')).toBe(undefined)
+  expect(spend.perPoint.seven_day).toBe(1000)
+})
+
+test('spendTurn keeps one entry a minute and the last hour', () => {
+  let spend = spendTurn(NO_SPEND, START, usage(100, 10, 1000))
+  spend = spendTurn(spend, START + 10_000, usage(50))
+  // The 1000 the cache served weigh a tenth and are not among the tokens shown.
+  expect(spend.events).toEqual([{ t: START, tokens: 160, weight: 300 }])
+
+  spend = spendTurn(spend, START + 61 * MINUTE, usage(1))
+  expect(spend.events).toEqual([{ t: START + 61 * MINUTE, tokens: 1, weight: 1 }])
+  expect(spend.total).toBe(301)
+})
+
+test('the card shows the estimate and the tokens beside the points', () => {
+  const window = { samples: [{ t: START, used: 66 }, { t: START + 20 * MINUTE, used: 66 }] }
+  const at = START + 20 * MINUTE
+  const uncalibrated = spendTurn(NO_SPEND, at - 5 * MINUTE, usage(200_000))
+
+  // The whole-number reading did not move, and tokens went: under a point, not none.
+  expect(details('seven_day', window, at, uncalibrated)).toBe(
+    'Semanal · 7d: 66% usado · 15m <1% · 200k · 30m – · 200k · 1h – · 200k · ✓',
+  )
+
+  const calibrated = { ...uncalibrated, marks: { seven_day: 0 }, perPoint: { seven_day: 500_000 } }
+  expect(details('seven_day', window, at, calibrated)).toBe(
+    'Semanal · 7d: ~66.4% usado · 15m ~0.4% · 200k · 30m ~0.4% · 200k · 1h ~0.4% · 200k · ✓',
+  )
+  expect(cardSvg('seven_day', window, at, calibrated)).toContain('~66.4%')
+  // The card is markup: a bare `<` in a figure would leave it undrawn.
+  expect(cardSvg('seven_day', window, at, uncalibrated)).toContain('&lt;1% · 200k')
+})
+
+test('a turn that ends goes on the count the sessions share', async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  mock.store(on)
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('ui.render', () => EMPTY)
+  on('turn.complete', () => ({ text: '' }))
+  const turn = (input: number) =>
+    $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer', usage: { ...usage(input), model: 'm' } } as never)
+
+  await measure($, [{ kind: 'seven_day', percentUsed: 65 }])
+  await measure($, [{ kind: 'seven_day', percentUsed: 66 }])
+  await turn(1000)
+  await clock.advance(5 * MINUTE)
+  await measure($, [{ kind: 'seven_day', percentUsed: 67 }])
+  await turn(300)
+
+  await $.command.run({ command: 'limits', args: '' } as never)
+  const ui = await $.ui.mount({ plugin: 'limits-left', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+  const drawn = JSON.stringify(await ui.drawn())
+
+  // A point took the 1000 between 66 and 67; the 300 since are three tenths of the next.
+  expect(drawn).toContain('~67.3%')
+  expect(drawn).toContain('~1.3% · 1.3k')
 })
