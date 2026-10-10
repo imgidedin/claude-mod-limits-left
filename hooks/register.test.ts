@@ -60,10 +60,10 @@ test('forecast projects the pace of the last hour onto what is left', () => {
   const at = START + 60 * MINUTE
 
   // 30 points an hour, 60 left: two hours.
-  expect(forecast({ samples }, at)).toBe('esgota em ~2h00')
-  expect(forecast({ samples, resetsAt: new Date(at + 90 * MINUTE).toISOString() }, at)).toBe('✓')
-  expect(forecast({ samples: [{ t: START, used: 10 }] }, START + MINUTE)).toBe('coletando dados')
-  expect(forecast({ samples: [{ t: START, used: 10 }] }, at)).toBe('✓')
+  expect(forecast('five_hour', { samples }, at)).toBe('esgota em ~2h00')
+  expect(forecast('five_hour', { samples, resetsAt: new Date(at + 90 * MINUTE).toISOString() }, at)).toBe('✓')
+  expect(forecast('five_hour', { samples: [{ t: START, used: 10 }] }, START + MINUTE)).toBe('coletando dados')
+  expect(forecast('five_hour', { samples: [{ t: START, used: 10 }] }, at)).toBe('✓')
   expect(details('five_hour', { samples }, at)).toBe(
     'Limite de sessão · 5h: 40% usado · 15m 7.5% · 30m 15% · 1h 30% · esgota em ~2h00',
   )
@@ -182,7 +182,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
 }
 
 test('keeps the history between sessions and the band beneath the cards', async ($, on) => {
-  mock.clock(on, { now: START + 30 * MINUTE })
+  mock.clock(on, { now: START + 60 * MINUTE })
   mock.store(on, { windows: { five_hour: { samples: [{ t: START, used: 10 }] } } })
   on('session.measure', (_, e) => ({ changed: e.changed }))
   on('ui.render', () => ({ type: 'Box', children: [{ type: 'Text', children: ['another band'] }] }))
@@ -193,8 +193,8 @@ test('keeps the history between sessions and the band beneath the cards', async 
   const ui = await $.ui.mount({ plugin: 'limits-left', surface: 'terminal', component: 'AbovePrompt', props: BAND })
   const drawn = JSON.stringify(await ui.drawn())
 
-  // 15 points in the 30 minutes on record, 75 left: two and a half hours.
-  expect(drawn).toContain('esgota em ~2h30')
+  // 15 points in the hour on record, 75 left: five hours.
+  expect(drawn).toContain('esgota em ~5h00')
   expect(drawn).toContain('another band')
 })
 
@@ -238,25 +238,28 @@ test('the turns say where a window is inside a point once a whole point was seen
   expect(spend.perPoint.seven_day).toBe(1000)
 })
 
-test('spendTurn keeps one entry a minute and the last hour', () => {
+test('spendTurn keeps one entry a minute', () => {
   let spend = spendTurn(NO_SPEND, START, usage(100, 10, 1000))
   spend = spendTurn(spend, START + 10_000, usage(50))
   // The 1000 the cache served weigh a tenth and are not among the tokens shown.
   expect(spend.events).toEqual([{ t: START, tokens: 160, weight: 300 }])
 
   spend = spendTurn(spend, START + 61 * MINUTE, usage(1))
-  expect(spend.events).toEqual([{ t: START + 61 * MINUTE, tokens: 1, weight: 1 }])
+  expect(spend.events).toEqual([
+    { t: START, tokens: 160, weight: 300 },
+    { t: START + 61 * MINUTE, tokens: 1, weight: 1 },
+  ])
   expect(spend.total).toBe(301)
 })
 
 test('the card shows the estimate and the tokens beside the points', () => {
-  const window = { samples: [{ t: START, used: 66 }, { t: START + 20 * MINUTE, used: 66 }] }
-  const at = START + 20 * MINUTE
+  const window = { samples: [{ t: START, used: 66 }, { t: START + 40 * MINUTE, used: 66 }] }
+  const at = START + 40 * MINUTE
   const uncalibrated = spendTurn(NO_SPEND, at - 5 * MINUTE, usage(200_000))
 
   // The whole-number reading did not move, and tokens went: under a point, not none.
   expect(details('seven_day', window, at, uncalibrated)).toBe(
-    'Semanal · 7d: 66% usado · 15m <1% · 200k · 30m – · 200k · 1h – · 200k · ✓',
+    'Semanal · 7d: 66% usado · 15m <1% · 200k · 30m <1% · 200k · 1h – · 200k · ✓',
   )
 
   const calibrated = { ...uncalibrated, marks: { seven_day: 0 }, perPoint: { seven_day: 500_000 } }
@@ -317,4 +320,75 @@ test('toasts once when a reading puts a window over its pace', async ($, on) => 
   await clock.advance(MINUTE)
   await measure($, [{ kind: 'five_hour', percentUsed: 41, resetsAt: resetsAt(239) }])
   expect(toasts.length).toBe(1)
+})
+
+test('says nothing of the pace on a short history or a single point turning', () => {
+  const at = START + 40 * MINUTE
+  const turned = (minutes: number) => [
+    { t: at - minutes * MINUTE, used: 65 },
+    { t: at - 2 * MINUTE, used: 66 },
+    { t: at, used: 66 },
+  ]
+
+  // One point in twenty minutes is no pace, and neither is one in forty.
+  expect(forecast('seven_day', { samples: turned(20) }, at)).toBe('coletando dados')
+  expect(forecast('seven_day', { samples: turned(40) }, at)).toBe('coletando dados')
+  expect(isOverPace('seven_day', { samples: turned(40) }, at)).toBe(false)
+
+  // Nothing turning for half an hour is a pace: none.
+  expect(forecast('seven_day', { samples: [{ t: at - 30 * MINUTE, used: 66 }, { t: at, used: 66 }] }, at)).toBe('✓')
+
+  // Two points in forty minutes: 3 an hour, 34 left.
+  const twice = [{ t: at - 40 * MINUTE, used: 64 }, { t: at - 20 * MINUTE, used: 65 }, { t: at, used: 66 }]
+  expect(forecast('seven_day', { samples: twice }, at)).toBe('esgota em ~11h20')
+})
+
+test('the weekly window keeps a day of readings, a run of equal ones as its two ends', () => {
+  const HOUR = 60 * MINUTE
+  let samples = record([], START, 60, 24 * HOUR)
+  for (let minute = 1; minute <= 180; minute++) samples = record(samples, START + minute * MINUTE, minute < 90 ? 60 : 61, 24 * HOUR)
+
+  expect(samples).toEqual([
+    { t: START, used: 60 },
+    { t: START + 89 * MINUTE, used: 60 },
+    { t: START + 90 * MINUTE, used: 61 },
+    { t: START + 180 * MINUTE, used: 61 },
+  ])
+
+  // A point in three hours of a day's history: 8 a day, under the 15 that warn.
+  expect(isOverPace('seven_day', { samples, resetsAt: new Date(START + 30 * HOUR).toISOString() }, START + 180 * MINUTE)).toBe(false)
+  // Past the day, the run's first end alone anchors it.
+  expect(record(samples, START + 26 * HOUR, 61, 24 * HOUR)).toEqual([
+    { t: START + 90 * MINUTE, used: 61 },
+    { t: START + 26 * HOUR, used: 61 },
+  ])
+})
+
+test('the turns give the pace once the weight of a point is known', () => {
+  const at = START + 60 * MINUTE
+  // A point of the 5-hour window turned a minute ago and reads as a rush; the turns say
+  // 2 points in the hour, which the 60 left outlast.
+  const samples = [{ t: START, used: 39 }, { t: at - MINUTE, used: 40 }, { t: at, used: 40 }]
+  const window = { samples, resetsAt: new Date(at + 200 * MINUTE).toISOString() }
+  let spend = spendTurn(NO_SPEND, START, usage(0))
+  spend = spendTurn(spend, START + 10 * MINUTE, usage(1000))
+  spend = spendTurn(spend, at - 10 * MINUTE, usage(1000))
+  spend = { ...spend, perPoint: { five_hour: 1000 } }
+
+  expect(spend.since).toBe(START)
+  expect(forecast('five_hour', window, at, spend)).toBe('✓')
+  expect(forecast('five_hour', { ...window, samples: [{ t: START, used: 97 }, { t: at, used: 98 }] }, at, spend)).toBe('esgota em ~1h00')
+
+  // Until the count is half an hour old the readings still give it.
+  expect(forecast('five_hour', window, START + 20 * MINUTE, spend)).toBe('coletando dados')
+})
+
+test('spendTurn keeps a day of turns, those past the hour further apart', () => {
+  let spend = NO_SPEND
+  for (let minute = 0; minute <= 120; minute += 2) spend = spendTurn(spend, START + minute * MINUTE, usage(10))
+
+  // Seven entries for the first hour, ten minutes apart, then one every two minutes.
+  expect(spend.events.filter(event => event.t <= START + 60 * MINUTE).length).toBe(7)
+  expect(spend.events.reduce((sum, event) => sum + event.tokens, 0)).toBe(610)
+  expect(spendTurn(spend, START + 26 * 60 * MINUTE, usage(1)).events.length).toBe(1)
 })

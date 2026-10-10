@@ -13,7 +13,9 @@ export type Spent = { t: number; tokens: number; weight: number }
 export type Spend = {
   // The weight of every turn on record; it only grows.
   total: number
-  // The last hour, one entry a minute.
+  // When the count began; absent on one kept from before it was recorded.
+  since?: number
+  // The last day: one entry a minute for the last hour, further apart before it.
   events: Spent[]
   // By window kind: `total` when its reading last moved up a whole point.
   marks: Record<string, number>

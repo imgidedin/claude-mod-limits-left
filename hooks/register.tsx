@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, Register, RenderElement, RenderInput, SessionRateLimit } from 'claude-code'
 
-import type { LimitWindow, Sample, Spend, Windows } from '../types'
+import type { LimitWindow, Sample, Spend, Spent, Windows } from '../types'
 
 // Left to right: the 5-hour window, then the weekly one.
 const KINDS = ['five_hour', 'seven_day'] as const
@@ -16,7 +16,13 @@ const SPANS = [
 ] as const
 
 // The shortest stretch of history a pace is estimated from.
-const MIN_PACE_MS = 5 * MINUTE
+const MIN_PACE_MS = 30 * MINUTE
+// How far back a window's pace looks, and so how much of its history is kept: an hour says
+// little about a week.
+const HISTORY: Record<string, number> = { five_hour: HOUR, seven_day: DAY }
+const historyOf = (kind: string): number => HISTORY[kind] ?? HOUR
+// Turns older than an hour are kept in entries this far apart, a day of them.
+const OLD_ENTRY_MS = 10 * MINUTE
 const STORE_KEY = 'windows'
 // Its own key: a session still running the mod as it was reads windows alone and keeps it whole.
 const SPEND_KEY = 'spend'
@@ -85,8 +91,9 @@ const COMMAND = 'limits'
 
 const round1 = (n: number): number => Math.round(n * 10) / 10
 
-// Adds a reading, keeping one sample a minute and nothing older than the one that anchors the last hour.
-export const record = (samples: readonly Sample[], t: number, used: number): Sample[] => {
+// Adds a reading, keeping one sample a minute, the two ends alone of a run of equal readings,
+// and nothing older than the one that anchors the last `keep`.
+export const record = (samples: readonly Sample[], t: number, used: number, keep: number = HOUR): Sample[] => {
   const last = samples.at(-1)
   if (last === undefined) return [{ t, used }]
   // The window reset: what came before says nothing about it.
@@ -95,8 +102,9 @@ export const record = (samples: readonly Sample[], t: number, used: number): Sam
   if (used < last.used) return [...samples]
 
   const before = samples.at(-2)
-  const head = before !== undefined && t - before.t < MINUTE ? samples.slice(0, -1) : samples
-  const firstInside = head.findIndex(s => s.t >= t - HOUR)
+  const isRun = before !== undefined && before.used === last.used && last.used === used
+  const head = before !== undefined && (t - before.t < MINUTE || isRun) ? samples.slice(0, -1) : samples
+  const firstInside = head.findIndex(s => s.t >= t - keep)
   const from = firstInside === -1 ? head.length - 1 : Math.max(0, firstInside - 1)
 
   return [...head.slice(from), { t, used }]
@@ -132,16 +140,30 @@ const duration = (ms: number): string => {
   return h > 0 ? `${h}h${String(m).padStart(2, '0')}` : `${m}min`
 }
 
-// Points of the window used per millisecond over the last hour, or over what history there is.
-const pace = (samples: readonly Sample[], at: number): number | undefined => {
+// Points of the window used per millisecond over its history, or over what there is of it;
+// undefined while that is too little to say. Where the weight of a point is known the turns
+// give it, since they move with every turn and a reading only a whole point at a time.
+const pace = (kind: string, window: LimitWindow, at: number, held: Spend): number | undefined => {
+  const perPoint = held.perPoint[kind]
+  if (perPoint !== undefined && held.since !== undefined) {
+    const span = Math.min(historyOf(kind), at - held.since)
+    if (span >= MIN_PACE_MS) return spentIn(held, at, span).weight / perPoint / span
+  }
+
+  const { samples } = window
   const first = samples[0]
   const last = samples.at(-1)
   if (first === undefined || last === undefined) return undefined
 
-  const span = Math.min(HOUR, at - first.t)
+  const span = Math.min(historyOf(kind), at - first.t)
   if (span < MIN_PACE_MS) return undefined
 
-  return Math.max(0, last.used - (usedAt(samples, at - span) ?? last.used)) / span
+  // One point turning says when it turned, not how fast the window goes.
+  const from = at - span
+  const rises = samples.filter((s, i) => i > 0 && s.t > from && s.used > (samples[i - 1]?.used ?? s.used)).length
+  if (rises === 1 && span < HOUR) return undefined
+
+  return Math.max(0, last.used - (usedAt(samples, from) ?? last.used)) / span
 }
 
 const left = (window: LimitWindow): number => Math.max(0, 100 - (window.samples.at(-1)?.used ?? 0))
@@ -155,14 +177,22 @@ export const spendTurn = (held: Spend, t: number, usage: ModelUsage): Spend => {
     usage.output_tokens * OUTPUT_WEIGHT +
     usage.cache_creation_input_tokens * CACHE_WRITE_WEIGHT +
     usage.cache_read_input_tokens * CACHE_READ_WEIGHT
-  const recent = held.events.filter(event => event.t > t - HOUR)
+  // The last hour a minute apart, for the cards' spans; the rest of the day further apart.
+  const recent = held.events
+    .filter(event => event.t > t - DAY)
+    .reduce<Spent[]>((kept, event) => {
+      const prev = kept.at(-1)
+      if (prev === undefined || event.t > t - HOUR || event.t - prev.t >= OLD_ENTRY_MS) return [...kept, event]
+
+      return [...kept.slice(0, -1), { t: prev.t, tokens: prev.tokens + event.tokens, weight: prev.weight + event.weight }]
+    }, [])
   const last = recent.at(-1)
   const events =
     last !== undefined && t - last.t < MINUTE
       ? [...recent.slice(0, -1), { t: last.t, tokens: last.tokens + tokens, weight: last.weight + weight }]
       : [...recent, { t, tokens, weight }]
 
-  return { ...held, total: held.total + weight, events }
+  return { ...held, since: held.since ?? t, total: held.total + weight, events }
 }
 
 // A window's reading went from one whole number to another: up, the turns since the last
@@ -210,8 +240,8 @@ const resetsIn = (window: LimitWindow, at: number): number =>
 // What the pace of the last hour does to what is left: fine, or out before the reset.
 export type Outlook = { state: 'collecting' | 'ok' | 'out' } | { state: 'runsOut'; inMs: number }
 
-export const outlook = (window: LimitWindow, at: number): Outlook => {
-  const rate = pace(window.samples, at)
+export const outlook = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): Outlook => {
+  const rate = pace(kind, window, at, held)
   if (rate === undefined) return { state: 'collecting' }
   if (left(window) === 0) return { state: 'out' }
   if (rate === 0) return { state: 'ok' }
@@ -221,8 +251,8 @@ export const outlook = (window: LimitWindow, at: number): Outlook => {
   return lastsMs >= resetsIn(window, at) ? { state: 'ok' } : { state: 'runsOut', inMs: lastsMs }
 }
 
-export const forecast = (window: LimitWindow, at: number): string => {
-  const o = outlook(window, at)
+export const forecast = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): string => {
+  const o = outlook(kind, window, at, held)
   if (o.state === 'ok') return '✓'
   if (o.state === 'collecting') return 'coletando dados'
   if (o.state === 'runsOut') return `esgota em ~${duration(o.inMs)}`
@@ -232,8 +262,8 @@ export const forecast = (window: LimitWindow, at: number): string => {
 
 // The 5-hour window warns when it runs out more than half an hour before it resets; the weekly
 // one when a day at that pace takes more than 15 points and it runs out before it resets.
-export const isOverPace = (kind: string, window: LimitWindow, at: number): boolean => {
-  const rate = pace(window.samples, at)
+export const isOverPace = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): boolean => {
+  const rate = pace(kind, window, at, held)
   if (rate === undefined || rate === 0) return false
 
   const lastsMs = left(window) / rate
@@ -252,8 +282,8 @@ const SHORT_TITLES: Record<string, string> = { five_hour: '5h', seven_day: '7d' 
 
 // What the toast says when a reading puts a window over its pace; the app puts the mod's name
 // before it, so it is kept short.
-export const warning = (kind: string, window: LimitWindow, at: number): string =>
-  `${SHORT_TITLES[kind] ?? kind} acima do ritmo · ${forecast(window, at)}`
+export const warning = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): string =>
+  `${SHORT_TITLES[kind] ?? kind} acima do ritmo · ${forecast(kind, window, at, held)}`
 const SPAN_TITLES = ['Últimos 15 min', 'Últimos 30 min', 'Última hora'] as const
 
 const usedOf = (window: LimitWindow): number => round1(100 - left(window))
@@ -298,7 +328,7 @@ export const details = (kind: string, window: LimitWindow, at: number, held: Spe
     `${TITLES[kind] ?? kind}: ${usedLabel(kind, window, held)} usado`,
     resetLine(window, at),
     ...spanFigures(kind, window, at, held).map((figure, i) => `${SPANS[i]?.label} ${figure}`),
-    forecast(window, at),
+    forecast(kind, window, at, held),
   ]
     .filter(part => part !== '')
     .join(' · ')
@@ -320,7 +350,7 @@ text{font-family:${FONT};font-size:12px}
 // card has it, then what the last 15 minutes, 30 minutes and hour took, and where that leads.
 export const cardSvg = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): string => {
   const right = CARD_W - 14
-  const o = outlook(window, at)
+  const o = outlook(kind, window, at, held)
   const used = Math.min(100, usedOf(window) + (fraction(held, kind) ?? 0))
   const rows = spanFigures(kind, window, at, held)
     .map((figure, i) => {
@@ -333,7 +363,7 @@ export const cardSvg = (kind: string, window: LimitWindow, at: number, held: Spe
   const verdict =
     o.state === 'ok'
       ? `<path class="ok" d="M${right - 12} 131l4 4 8-9" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`
-      : `<text class="${o.state === 'collecting' ? 's' : 'bad'}" x="${right}" y="136" text-anchor="end">${forecast(window, at)}</text>`
+      : `<text class="${o.state === 'collecting' ? 's' : 'bad'}" x="${right}" y="136" text-anchor="end">${forecast(kind, window, at, held)}</text>`
 
   return [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${CARD_W}" height="${CARD_H}" viewBox="0 0 ${CARD_W} ${CARD_H}">`,
@@ -392,9 +422,9 @@ const gather = async ($: EngineInterface): Promise<{ shown: Shown[]; at: number;
 }
 
 // One window in the footer: its icon, what is left of it, and a mark where it is over pace.
-export const footerLabel = ({ kind, window, left }: Shown, at: number, isTerminal: boolean): string => {
+export const footerLabel = ({ kind, window, left }: Shown, at: number, isTerminal: boolean, held: Spend = NO_SPEND): string => {
   const icon = ICONS[kind]
-  const mark = isOverPace(kind, window, at) ? (isTerminal ? ' ⚠' : ' 🛑') : ''
+  const mark = isOverPace(kind, window, at, held) ? (isTerminal ? ' ⚠' : ' 🛑') : ''
 
   return `${icon === undefined ? '' : `${isTerminal ? icon.glyph : icon.emoji} `}${left}%${mark}`
 }
@@ -409,7 +439,7 @@ const drawCards = async ($: EngineInterface, e: RenderInput): Promise<RenderElem
   const { Box, Button, Text } = ui
   // The terminal has no pixels to draw with: bordered boxes for the cards, a triangle for him.
   const hasPixels = e.surface !== 'terminal' && 'Svg' in ui
-  const isAnyOverPace = shown.some(({ kind, window }) => isOverPace(kind, window, at))
+  const isAnyOverPace = shown.some(({ kind, window }) => isOverPace(kind, window, at, held))
 
   return (
     <Box width="100%" alignItems="center" justifyContent={hasPixels ? 'flex-end' : 'flex-start'} gap={1}>
@@ -436,7 +466,7 @@ const drawCards = async ($: EngineInterface, e: RenderInput): Promise<RenderElem
             ))}
             <Box justifyContent="space-between">
               <Text dimColor>No ritmo atual</Text>
-              <Text color={outlook(window, at).state === 'ok' ? 'success' : 'warning'}>{forecast(window, at)}</Text>
+              <Text color={outlook(kind, window, at, held).state === 'ok' ? 'success' : 'warning'}>{forecast(kind, window, at, held)}</Text>
             </Box>
           </Box>
         ),
@@ -482,13 +512,13 @@ export const register: Register = on => {
     for (const limit of fresh) {
       const known = held[limit.kind]
       const before = known?.samples.at(-1)?.used
-      const samples = record(known?.samples ?? [], t, limit.percentUsed)
+      const samples = record(known?.samples ?? [], t, limit.percentUsed, historyOf(limit.kind))
       const window = limit.resetsAt === undefined ? { samples } : { samples, resetsAt: limit.resetsAt }
       merged[limit.kind] = window
       // Said once, by the reading that crosses the line: the store is shared, so the other
       // sessions find the window already over its pace and stay quiet.
-      const wasOverPace = known !== undefined && isOverPace(limit.kind, known, t)
-      if (!wasOverPace && isOverPace(limit.kind, window, t)) warnings.push(warning(limit.kind, window, t))
+      const wasOverPace = known !== undefined && isOverPace(limit.kind, known, t, counted)
+      if (!wasOverPace && isOverPace(limit.kind, window, t, counted)) warnings.push(warning(limit.kind, window, t, counted))
       // A reading a little under the last is another session's older one, as `record` has it.
       const isOlder = before !== undefined && limit.percentUsed < before && limit.percentUsed >= before - 1
       if (before !== undefined && !isOlder) turned = turnPoint(turned, limit.kind, before, limit.percentUsed)
@@ -529,13 +559,13 @@ export const register: Register = on => {
   // The prompt footer, where the session's mode labels are. On the desktop each window is a
   // button, and either one puts both cards up or takes them down; the terminal's is one line.
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
-    const { shown, at } = await gather($)
+    const { shown, at, held } = await gather($)
     if (shown.length === 0) return next(e)
 
     const { Box, Button, Text } = $.ui.resolve(e)
     const modes = e.props.modes.join(' & ')
     if (e.surface === 'terminal') {
-      const line = shown.map(window => footerLabel(window, at, true)).join(' · ')
+      const line = shown.map(window => footerLabel(window, at, true, held)).join(' · ')
 
       return <Text dimColor>{modes === '' ? line : `${modes}  ${line}`}</Text>
     }
@@ -546,7 +576,7 @@ export const register: Register = on => {
         {shown.map(window => (
           <Button
             key={`limits-${window.kind}`}
-            label={`${PAD}${footerLabel(window, at, false)}${PAD}`}
+            label={`${PAD}${footerLabel(window, at, false, held)}${PAD}`}
             onPress={() => update($, isOpen, shown => !shown)}
           />
         ))}

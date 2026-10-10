@@ -101,9 +101,10 @@ O limite de 15 pontos por dia existe para sobrar cota até o fim da semana: uma 
 
 ## Como funciona
 
-A cada resposta do modelo, o Claude Code informa quanto de cada janela já foi usado. O mod registra essa leitura com a hora, mantém a última hora de histórico e calcula tudo a partir daí.
+A cada resposta do modelo, o Claude Code informa quanto de cada janela já foi usado. O mod registra essa leitura com a hora, mantém a última hora de histórico da janela de 5 horas e o último dia da semanal, e calcula tudo a partir daí.
 
-- **Ritmo:** o consumo da última hora, ou do histórico que existir, a partir de 5 minutos. Antes disso o cartão mostra `coletando dados`.
+- **Ritmo:** o consumo da última hora na janela de 5 horas e das últimas 24 horas na semanal, ou do histórico que existir. Quando o mod já sabe quantos tokens cabem em um ponto, o ritmo vem da contagem de tokens, que anda a cada turno; antes disso, vem das leituras.
+- **Mínimo para prever:** 30 minutos de histórico. Um único ponto virando em menos de uma hora também não basta, porque diz quando o ponto virou e não a que velocidade a janela anda. Até lá o cartão mostra `coletando dados`.
 - **Intervalos sem leitura:** se o Claude Code ficou fechado, o consumo do intervalo é distribuído por interpolação entre as leituras de antes e de depois.
 - **Reset da janela:** quando o percentual usado cai, o histórico daquela janela recomeça do zero.
 - **Onde fica guardado:** no armazenamento do próprio mod, dentro da pasta de configuração do Claude Code. Nada sai da sua máquina; o mod não faz nenhuma chamada de rede.
@@ -117,7 +118,7 @@ As leituras chegam em pontos inteiros, então sozinhas elas não dizem quanto vo
 - **Tokens exibidos:** entrada, saída e escrita de cache. A leitura de cache fica de fora, porque cada passo relê a conversa inteira e o número deixaria de dizer algo.
 - **Limite do erro:** a estimativa nunca passa de 0,9 dentro do ponto atual e é corrigida a cada virada. Uso fora das sessões com o mod (o chat do claude.ai, outras máquinas) não é contado, e faz o ponto virar antes do previsto.
 
-O ritmo e o aviso continuam vindo só das leituras inteiras. Na janela de 7 dias isso deixa o ritmo de curto prazo granulado: um único ponto na última hora já equivale a 24 pontos por dia. Por isso o aviso semanal exige também que a cota acabe antes do reset.
+Na janela de 7 dias o ritmo é medido sobre um dia inteiro, então o aviso semanal leva algumas horas para reagir a um pico de uso. Ele exige também que a cota acabe antes do reset.
 
 ## Limitações conhecidas
 
