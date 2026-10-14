@@ -315,31 +315,44 @@ test('a turn that ends goes on the count the sessions share', async ($, on) => {
   expect(drawn).toContain('~1.3% · 1.3k')
 })
 
-test('toasts once when a reading puts a window over its pace', async ($, on) => {
-  const clock = mock.clock(on, { now: START })
-  mock.store(on)
-  const toasts: string[] = []
-  on('session.measure', (_, e) => ({ changed: e.changed }))
-  on('ui.toast', (_, e) => {
-    toasts.push(e.text)
+// The desktop has no terminal to notify through: the warning is a toast there.
+for (const isSent of [false, true]) {
+  test(`warns once when a reading puts a window over its pace (${isSent ? 'notified' : 'no terminal: a toast'})`, async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    mock.store(on)
+    const notified: string[] = []
+    const toasts: string[] = []
+    on('session.measure', (_, e) => ({ changed: e.changed }))
+    on('ui.notify', (_, e) => {
+      notified.push(e.text)
 
-    return { value: undefined }
+      return { value: isSent ? { isSent: true, channel: 'kitty' } : { isSent: false, reason: 'no-surface' } }
+    })
+    on('ui.toast', (_, e) => {
+      toasts.push(e.text)
+
+      return { value: undefined }
+    })
+    const resetsAt = (minutes: number) => new Date(clock.now() + minutes * MINUTE).toISOString()
+    const WARNING = '5h acima do ritmo · esgota em ~2h00'
+
+    await measure($, [{ kind: 'five_hour', percentUsed: 10, resetsAt: resetsAt(300) }])
+    expect(notified).toEqual([])
+
+    // 30 points in the hour, 60 left: out in two hours, with four to the reset.
+    await clock.advance(60 * MINUTE)
+    await measure($, [{ kind: 'five_hour', percentUsed: 40, resetsAt: resetsAt(240) }])
+    await clock.advance(0)
+    expect(notified).toEqual([WARNING])
+    expect(toasts).toEqual(isSent ? [] : [WARNING])
+
+    // Still over it a minute later: nothing more to say.
+    await clock.advance(MINUTE)
+    await measure($, [{ kind: 'five_hour', percentUsed: 41, resetsAt: resetsAt(239) }])
+    await clock.advance(0)
+    expect(notified.length).toBe(1)
   })
-  const resetsAt = (minutes: number) => new Date(clock.now() + minutes * MINUTE).toISOString()
-
-  await measure($, [{ kind: 'five_hour', percentUsed: 10, resetsAt: resetsAt(300) }])
-  expect(toasts).toEqual([])
-
-  // 30 points in the hour, 60 left: out in two hours, with four to the reset.
-  await clock.advance(60 * MINUTE)
-  await measure($, [{ kind: 'five_hour', percentUsed: 40, resetsAt: resetsAt(240) }])
-  expect(toasts).toEqual(['5h acima do ritmo · esgota em ~2h00'])
-
-  // Still over it a minute later: nothing more to say.
-  await clock.advance(MINUTE)
-  await measure($, [{ kind: 'five_hour', percentUsed: 41, resetsAt: resetsAt(239) }])
-  expect(toasts.length).toBe(1)
-})
+}
 
 test('says nothing of the pace on a short history or a single point turning', () => {
   const at = START + 40 * MINUTE

@@ -19,7 +19,7 @@ acompanha o seu ritmo de consumo e avisa antes de você ficar sem cota.
 - **Guarda o histórico de consumo.** Uma amostra por minuto de cada janela, compartilhada entre todas as suas sessões e mantida entre reinícios.
 - **Calcula o seu ritmo.** Quanto você usou nos últimos 15 minutos, 30 minutos e na última hora, em pontos da janela e em tokens, e se nesse ritmo a cota acaba antes do reset.
 - **Estima a casa decimal.** As leituras chegam em pontos inteiros; o mod conta os tokens dos seus turnos para estimar onde você está dentro do ponto atual (`~66.4%`).
-- **Avisa quando o ritmo está alto demais.** Um `🛑` aparece ao lado da janela em risco, e o Claude em pânico aparece junto dos cartões. Na leitura em que a janela passa do ritmo, um aviso rápido (toast) diz qual foi e em quanto tempo ela esgota.
+- **Avisa quando o ritmo está alto demais.** Um `🛑` aparece ao lado da janela em risco, e o Claude em pânico aparece junto dos cartões. Na leitura em que a janela passa do ritmo, um aviso diz qual foi e em quanto tempo ela esgota: notificação do sistema no terminal, toast no app desktop.
 
 <div align="center">
 

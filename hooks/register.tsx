@@ -443,6 +443,13 @@ export const footerLabel = ({ kind, window, left }: Shown, at: number, isTermina
   return `${icon === undefined ? '' : `${isTerminal ? icon.glyph : icon.emoji} `}${left}%${mark}`
 }
 
+// The person's own notification where a terminal takes it; a toast where none does, as on the
+// desktop, which has no terminal to write it to.
+const warn = async ($: EngineInterface, text: string): Promise<void> => {
+  const sent = await $.ui.notify(text).catch(() => undefined)
+  if (sent?.isSent !== true) $.ui.toast(text, { timeoutMs: WARNING_MS })
+}
+
 // The cards, one per window, with him beside them while a window is over pace. They keep to
 // the band's right end, over the footer's buttons that put them up.
 const drawCards = async ($: EngineInterface, e: RenderInput): Promise<RenderElement | undefined> => {
@@ -456,7 +463,8 @@ const drawCards = async ($: EngineInterface, e: RenderInput): Promise<RenderElem
   const isAnyOverPace = shown.some(({ kind, window }) => isOverPace(kind, window, at, held))
 
   return (
-    <Box width="100%" alignItems="center" justifyContent={hasPixels ? 'flex-end' : 'flex-start'} gap={1}>
+    // A band too narrow for both cards in a row takes the second under the first.
+    <Box width="100%" flexWrap="wrap" alignItems="center" justifyContent={hasPixels ? 'flex-end' : 'flex-start'} gap={1}>
       {!isAnyOverPace ? null : hasPixels ? (
         <ui.Svg source={PANIC_SVG} alt={PANIC_ALT} width={PANIC_W * 2} height={PANIC_H * 2} />
       ) : (
@@ -464,7 +472,8 @@ const drawCards = async ($: EngineInterface, e: RenderInput): Promise<RenderElem
       )}
       {shown.map(({ kind, window }) =>
         hasPixels ? (
-          <ui.Svg key={kind} source={cardSvg(kind, window, at, held)} alt={details(kind, window, at, held)} width={CARD_W} height={CARD_H} />
+          // No size of its own: the markup's 300 by 150, shrunk to fit a narrower band.
+          <ui.Svg key={kind} source={cardSvg(kind, window, at, held)} alt={details(kind, window, at, held)} />
         ) : (
           <Box key={kind} flexDirection="column" width={40} borderStyle="round" paddingX={1}>
             <Box justifyContent="space-between">
@@ -545,7 +554,7 @@ export const register: Register = on => {
       await update($, spend, () => turned)
       await update($, now, () => t)
     }
-    for (const text of warnings) void $.ui.toast(text, { timeoutMs: WARNING_MS })
+    for (const text of warnings) void warn($, text)
 
     return next(e)
   })
@@ -587,13 +596,23 @@ export const register: Register = on => {
     return (
       <Box alignItems="center" gap={1}>
         {modes === '' ? null : <Text>{modes}</Text>}
-        {shown.map(window => (
-          <Button
-            key={`limits-${window.kind}`}
-            label={`${PAD}${footerLabel(window, at, false, held)}${PAD}`}
-            onPress={() => update($, isOpen, shown => !shown)}
-          />
-        ))}
+        {shown.map(item => {
+          const icon = ICONS[item.kind]?.emoji
+
+          return (
+            <Button
+              key={`limits-${item.kind}`}
+              label={footerLabel(item, at, false, held)}
+              onPress={() => update($, isOpen, shown => !shown)}
+            >
+              {PAD}
+              {icon === undefined ? null : <Text dimColor>{`${icon} `}</Text>}
+              {`${item.left}%`}
+              {isOverPace(item.kind, item.window, at, held) ? <Text color="error"> 🛑</Text> : null}
+              {PAD}
+            </Button>
+          )
+        })}
       </Box>
     )
   })
