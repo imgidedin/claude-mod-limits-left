@@ -232,10 +232,29 @@ test('the turns say where a window is inside a point once a whole point was seen
   spend = spendTurn(spend, START + 6 * MINUTE, usage(5000))
   expect(fraction(spend, 'seven_day')).toBe(0.9)
 
+  // The reading did not turn on 5450 of weight: a point takes at least that.
+  expect(spend.perPoint.seven_day).toBe(5450)
+
   // A reset takes the mark and keeps what a point takes.
   spend = turnPoint(spend, 'seven_day', 67, 0)
   expect(fraction(spend, 'seven_day')).toBe(undefined)
+  expect(spend.perPoint.seven_day).toBe(5450)
+})
+
+test('the last hour is not read as more points than the reading allows', () => {
+  // Measured short (usage outside the mod went into it), a point seems to take 1000.
+  let spend = turnPoint(NO_SPEND, 'seven_day', 50, 51)
+  spend = spendTurn(spend, START, usage(1000))
+  spend = turnPoint(spend, 'seven_day', 51, 52)
   expect(spend.perPoint.seven_day).toBe(1000)
+
+  // 6000 more go by within the hour and the reading stays at 52.
+  for (let i = 1; i <= 6; i++) spend = spendTurn(spend, START + i * 5 * MINUTE, usage(1000))
+  const at = START + 30 * MINUTE
+  const window = { samples: [{ t: START, used: 51 }, { t: START + MINUTE, used: 52 }, { t: at, used: 52 }] }
+
+  // 7000 in the hour over a point of at least 6000: about one point, not seven.
+  expect(details('seven_day', window, at, spend)).toContain('1h ~1.2%')
 })
 
 test('spendTurn keeps one entry a minute', () => {

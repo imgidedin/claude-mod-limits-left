@@ -192,8 +192,22 @@ export const spendTurn = (held: Spend, t: number, usage: ModelUsage): Spend => {
       ? [...recent.slice(0, -1), { t: last.t, tokens: last.tokens + tokens, weight: last.weight + weight }]
       : [...recent, { t, tokens, weight }]
 
-  return { ...held, since: held.since ?? t, total: held.total + weight, events }
+  const total = held.total + weight
+
+  return { ...held, since: held.since ?? t, total, events, perPoint: atLeastSinceMark(held, total) }
 }
+
+// A point takes at least what went by since its reading turned and it has not turned again:
+// the count misses usage outside the mod's sessions, so a point it measured can come out short,
+// and the turns would then be read as several points where the reading moved one.
+const atLeastSinceMark = (held: Spend, total: number): Record<string, number> =>
+  Object.fromEntries(
+    Object.entries(held.perPoint).map(([kind, perPoint]) => {
+      const mark = held.marks[kind]
+
+      return [kind, mark === undefined ? perPoint : Math.max(perPoint, total - mark)]
+    }),
+  )
 
 // A window's reading went from one whole number to another: up, the turns since the last
 // time say what a point takes, and the count starts again; down, the window reset.
