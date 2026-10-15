@@ -21,6 +21,14 @@ const MIN_PACE_MS = 30 * MINUTE
 // little about a week.
 const HISTORY: Record<string, number> = { five_hour: HOUR, seven_day: DAY }
 const historyOf = (kind: string): number => HISTORY[kind] ?? HOUR
+// The most of a day Claude is at work: the rest is sleep, and nothing is used in it.
+const ACTIVE_DAY_MS = 14 * HOUR
+
+// A pace measured over `span`, as the pace of whole days. A window that looks back a day
+// outlasts the working day: a pace seen over less of it holds for the working hours alone,
+// and one seen over more has the idle hours in it already. A shorter window is left as it is.
+const overDays = (kind: string, rate: number, span: number): number =>
+  historyOf(kind) < DAY ? rate : (rate * span * ACTIVE_DAY_MS) / Math.min(span, ACTIVE_DAY_MS) / DAY
 // Turns older than an hour are kept in entries this far apart, a day of them.
 const OLD_ENTRY_MS = 10 * MINUTE
 const STORE_KEY = 'windows'
@@ -140,14 +148,14 @@ const duration = (ms: number): string => {
   return h > 0 ? `${h}h${String(m).padStart(2, '0')}` : `${m}min`
 }
 
-// Points of the window used per millisecond over its history, or over what there is of it;
+// Points of the window used per millisecond of the days ahead, from its history or what there is of it;
 // undefined while that is too little to say. Where the weight of a point is known the turns
 // give it, since they move with every turn and a reading only a whole point at a time.
 const pace = (kind: string, window: LimitWindow, at: number, held: Spend): number | undefined => {
   const perPoint = held.perPoint[kind]
   if (perPoint !== undefined && held.since !== undefined) {
     const span = Math.min(historyOf(kind), at - held.since)
-    if (span >= MIN_PACE_MS) return spentIn(held, at, span).weight / perPoint / span
+    if (span >= MIN_PACE_MS) return overDays(kind, spentIn(held, at, span).weight / perPoint / span, span)
   }
 
   const { samples } = window
@@ -163,7 +171,7 @@ const pace = (kind: string, window: LimitWindow, at: number, held: Spend): numbe
   const rises = samples.filter((s, i) => i > 0 && s.t > from && s.used > (samples[i - 1]?.used ?? s.used)).length
   if (rises === 1 && span < HOUR) return undefined
 
-  return Math.max(0, last.used - (usedAt(samples, from) ?? last.used)) / span
+  return overDays(kind, Math.max(0, last.used - (usedAt(samples, from) ?? last.used)) / span, span)
 }
 
 const left = (window: LimitWindow): number => Math.max(0, 100 - (window.samples.at(-1)?.used ?? 0))
@@ -237,8 +245,12 @@ const compact = (tokens: number): string => {
 const resetsIn = (window: LimitWindow, at: number): number =>
   window.resetsAt === undefined ? Number.NaN : Date.parse(window.resetsAt) - at
 
-// What the pace of the last hour does to what is left: fine, or out before the reset.
-export type Outlook = { state: 'collecting' | 'ok' | 'out' } | { state: 'runsOut'; inMs: number }
+// What the pace does to what is left: fine, or out before the reset. Fine carries how long
+// what is left would last at that pace, where anything is being used at all.
+export type Outlook =
+  | { state: 'collecting' | 'out' }
+  | { state: 'ok'; lastsMs?: number }
+  | { state: 'runsOut'; inMs: number }
 
 export const outlook = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): Outlook => {
   const rate = pace(kind, window, at, held)
@@ -248,12 +260,15 @@ export const outlook = (kind: string, window: LimitWindow, at: number, held: Spe
 
   const lastsMs = left(window) / rate
 
-  return lastsMs >= resetsIn(window, at) ? { state: 'ok' } : { state: 'runsOut', inMs: lastsMs }
+  return lastsMs >= resetsIn(window, at) ? { state: 'ok', lastsMs } : { state: 'runsOut', inMs: lastsMs }
 }
+
+// How long what is left would last at a pace that is fine; '' where nothing is being used.
+const lasting = (o: Outlook): string => (o.state === 'ok' && o.lastsMs !== undefined ? `~${duration(o.lastsMs)}` : '')
 
 export const forecast = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): string => {
   const o = outlook(kind, window, at, held)
-  if (o.state === 'ok') return '✓'
+  if (o.state === 'ok') return [lasting(o), '✓'].filter(part => part !== '').join(' ')
   if (o.state === 'collecting') return 'coletando dados'
   if (o.state === 'runsOut') return `esgota em ~${duration(o.inMs)}`
 
@@ -359,10 +374,10 @@ export const cardSvg = (kind: string, window: LimitWindow, at: number, held: Spe
       return `<text class="s" x="14" y="${y}">${SPAN_TITLES[i]}</text><text class="t" x="${right}" y="${y}" text-anchor="end">${escapeXml(figure)}</text>`
     })
     .join('')
-  // Fine is a green check and nothing to read.
+  // Fine is a green check, with how long what is left would last beside it.
   const verdict =
     o.state === 'ok'
-      ? `<path class="ok" d="M${right - 12} 131l4 4 8-9" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`
+      ? `<text class="s" x="${right - 18}" y="136" text-anchor="end">${lasting(o)}</text><path class="ok" d="M${right - 12} 131l4 4 8-9" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`
       : `<text class="${o.state === 'collecting' ? 's' : 'bad'}" x="${right}" y="136" text-anchor="end">${forecast(kind, window, at, held)}</text>`
 
   return [

@@ -61,7 +61,8 @@ test('forecast projects the pace of the last hour onto what is left', () => {
 
   // 30 points an hour, 60 left: two hours.
   expect(forecast('five_hour', { samples }, at)).toBe('esgota em ~2h00')
-  expect(forecast('five_hour', { samples, resetsAt: new Date(at + 90 * MINUTE).toISOString() }, at)).toBe('✓')
+  // Fine when the reset comes first, and it still says how long the rest would last.
+  expect(forecast('five_hour', { samples, resetsAt: new Date(at + 90 * MINUTE).toISOString() }, at)).toBe('~2h00 ✓')
   expect(forecast('five_hour', { samples: [{ t: START, used: 10 }] }, START + MINUTE)).toBe('coletando dados')
   expect(forecast('five_hour', { samples: [{ t: START, used: 10 }] }, at)).toBe('✓')
   expect(details('five_hour', { samples }, at)).toBe(
@@ -81,6 +82,7 @@ test('the card says the pace is fine with a check and nothing to read', () => {
   expect(fine).toContain('class="ok"')
   expect(fine).toContain('Reinicia em 1h30')
   expect(fine).not.toContain('esgota')
+  expect(fine).toContain('>~2h00<')
   expect(short).toContain('esgota em ~2h00')
   expect(short).not.toContain('class="ok"')
 })
@@ -105,12 +107,12 @@ test('warns when a day at the weekly pace takes more than 15 points', () => {
   const at = START + 60 * MINUTE
   const paced = (used: number) => ({ samples: [{ t: START, used: 20 }, { t: at, used: 20 + used }] })
 
-  // 0.7 points an hour is 16.8 a day; 0.6 is 14.4.
-  expect(isOverPace('seven_day', paced(0.7), at)).toBe(true)
-  expect(isOverPace('seven_day', paced(0.6), at)).toBe(false)
+  // A day is 14 hours of work: 1.1 points an hour is 15.4 a day; 1 is 14.
+  expect(isOverPace('seven_day', paced(1.1), at)).toBe(true)
+  expect(isOverPace('seven_day', paced(1), at)).toBe(false)
 
-  // 79.3 left at 0.7 an hour lasts about 113 hours: no warning when the reset comes first.
-  const resetsIn = (hours: number) => ({ ...paced(0.7), resetsAt: new Date(at + hours * 60 * MINUTE).toISOString() })
+  // 78.9 left at 15.4 a day lasts about 123 hours: no warning when the reset comes first.
+  const resetsIn = (hours: number) => ({ ...paced(1.1), resetsAt: new Date(at + hours * 60 * MINUTE).toISOString() })
   expect(isOverPace('seven_day', resetsIn(19), at)).toBe(false)
   expect(isOverPace('seven_day', resetsIn(130), at)).toBe(true)
 })
@@ -338,9 +340,11 @@ test('says nothing of the pace on a short history or a single point turning', ()
   // Nothing turning for half an hour is a pace: none.
   expect(forecast('seven_day', { samples: [{ t: at - 30 * MINUTE, used: 66 }, { t: at, used: 66 }] }, at)).toBe('✓')
 
-  // Two points in forty minutes: 3 an hour, 34 left.
+  // Two points in forty minutes: 3 an hour of work, 42 a day of 14 of them, 34 left.
   const twice = [{ t: at - 40 * MINUTE, used: 64 }, { t: at - 20 * MINUTE, used: 65 }, { t: at, used: 66 }]
-  expect(forecast('seven_day', { samples: twice }, at)).toBe('esgota em ~11h20')
+  expect(forecast('seven_day', { samples: twice }, at)).toBe('esgota em ~19h26')
+  // The 5-hour window is over before the day is: its pace is the clock's.
+  expect(forecast('five_hour', { samples: twice }, at)).toBe('esgota em ~11h20')
 })
 
 test('the weekly window keeps a day of readings, a run of equal ones as its two ends', () => {
@@ -355,7 +359,7 @@ test('the weekly window keeps a day of readings, a run of equal ones as its two 
     { t: START + 180 * MINUTE, used: 61 },
   ])
 
-  // A point in three hours of a day's history: 8 a day, under the 15 that warn.
+  // A point in three hours of work: under 5 in a day of 14, under the 15 that warn.
   expect(isOverPace('seven_day', { samples, resetsAt: new Date(START + 30 * HOUR).toISOString() }, START + 180 * MINUTE)).toBe(false)
   // Past the day, the run's first end alone anchors it.
   expect(record(samples, START + 26 * HOUR, 61, 24 * HOUR)).toEqual([
@@ -376,7 +380,7 @@ test('the turns give the pace once the weight of a point is known', () => {
   spend = { ...spend, perPoint: { five_hour: 1000 } }
 
   expect(spend.since).toBe(START)
-  expect(forecast('five_hour', window, at, spend)).toBe('✓')
+  expect(forecast('five_hour', window, at, spend)).toBe('~1d6h ✓')
   expect(forecast('five_hour', { ...window, samples: [{ t: START, used: 97 }, { t: at, used: 98 }] }, at, spend)).toBe('esgota em ~1h00')
 
   // Until the count is half an hour old the readings still give it.
@@ -391,4 +395,16 @@ test('spendTurn keeps a day of turns, those past the hour further apart', () => 
   expect(spend.events.filter(event => event.t <= START + 60 * MINUTE).length).toBe(7)
   expect(spend.events.reduce((sum, event) => sum + event.tokens, 0)).toBe(610)
   expect(spendTurn(spend, START + 26 * 60 * MINUTE, usage(1)).events.length).toBe(1)
+})
+
+test('the weekly pace counts the hours of work in a day, not the 24 of the clock', () => {
+  const HOUR = 60 * MINUTE
+  const over = (hours: number, used: number) => ({ samples: [{ t: START, used: 20 }, { t: START + hours * HOUR, used: 20 + used }] })
+  const lasts = (hours: number, used: number) => forecast('seven_day', over(hours, used), START + hours * HOUR)
+
+  // 7 points in 7 hours of work make 14 in the day: the 73 left last five days and some.
+  expect(lasts(7, 7)).toBe('esgota em ~5d5h')
+  // 14 points with a night in them are the day's 14 already.
+  expect(lasts(20, 14)).toBe('esgota em ~4d17h')
+  expect(lasts(24, 14)).toBe('esgota em ~4d17h')
 })

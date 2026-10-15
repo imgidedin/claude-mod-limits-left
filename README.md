@@ -23,7 +23,7 @@ acompanha o seu ritmo de consumo e avisa antes de você ficar sem cota.
 
 <div align="center">
 
-<img src="docs/card-5h.svg" alt="Cartão da janela de 5 horas: cerca de 40,4% usado, reinicia em 51 minutos, 42 mil tokens nos últimos 15 minutos, ritmo ok" width="300">
+<img src="docs/card-5h.svg" alt="Cartão da janela de 5 horas: cerca de 40,4% usado, reinicia em 51 minutos, 42 mil tokens nos últimos 15 minutos, ritmo ok, duraria cerca de 15 horas" width="300">
 &nbsp;
 <img src="docs/card-7d.svg" alt="Cartão da janela semanal: cerca de 66,4% usado, reinicia em 18h51, 42 mil tokens nos últimos 15 minutos, ritmo ok" width="300">
 
@@ -63,7 +63,7 @@ Se a variável já existir, acrescente a pasta em vez de substituir. O separador
 
 ### Requisitos
 
-- Claude Code com suporte a mods (function hooks). Testado na versão 2.1.293.
+- Claude Code com suporte a mods (function hooks). Testado na versão 2.1.295.
 - Um plano por assinatura. Sem os limites de 5 horas e de 7 dias na conta, o mod não tem o que mostrar e fica invisível.
 
 ## Como usar
@@ -80,7 +80,7 @@ No terminal, o rodapé é uma linha de texto (`◷ 61% · ▦ 34%`) e os cartõe
 
 - **Cabeçalho:** a janela, quanto falta para reiniciar e o percentual já usado, com a barra de progresso. Um `~` na frente marca uma estimativa.
 - **Últimos 15 min, 30 min e última hora:** quantos pontos percentuais da janela foram consumidos em cada período e quantos tokens os seus turnos gastaram nele (`~0.4% · 42k`). Um traço (`–`) significa que o histórico ainda não cobre aquele período, e `<1%` que houve tokens mas a leitura ainda não virou um ponto.
-- **No ritmo atual:** um ✓ verde se a cota aguenta até o reset, ou `esgota em ~2h00` em vermelho se não aguenta.
+- **No ritmo atual:** um ✓ verde se a cota aguenta até o reset, com quanto tempo ela duraria nesse ritmo ao lado (`~15h00`), ou `esgota em ~2h00` em vermelho se não aguenta. Sem consumo recente, só o ✓.
 
 ### Quando o aviso aparece
 
@@ -90,6 +90,8 @@ No terminal, o rodapé é uma linha de texto (`◷ 61% · ▦ 34%`) e os cartõe
 | 7 dias | O ritmo atual passa de **15 pontos por dia** *e* a cota acaba antes do reset. |
 
 O limite de 15 pontos por dia existe para sobrar cota até o fim da semana: uma semana dividida igualmente dá cerca de 14 pontos por dia.
+
+Na janela de 7 dias, um dia conta como no máximo **14 horas de uso**: o resto é sono, e nele nada é gasto. Um ritmo de 1 ponto por hora vale então 14 pontos por dia, e não 24. A janela de 5 horas acaba antes do dia e segue o relógio.
 
 <div align="center">
 
@@ -104,6 +106,7 @@ O limite de 15 pontos por dia existe para sobrar cota até o fim da semana: uma 
 A cada resposta do modelo, o Claude Code informa quanto de cada janela já foi usado. O mod registra essa leitura com a hora, mantém a última hora de histórico da janela de 5 horas e o último dia da semanal, e calcula tudo a partir daí.
 
 - **Ritmo:** o consumo da última hora na janela de 5 horas e das últimas 24 horas na semanal, ou do histórico que existir. Quando o mod já sabe quantos tokens cabem em um ponto, o ritmo vem da contagem de tokens, que anda a cada turno; antes disso, vem das leituras.
+- **Dia de trabalho:** o ritmo semanal medido em menos de 14 horas é projetado para 14 horas de uso por dia; medido em mais do que isso, as horas paradas já estão nele e nada é ajustado.
 - **Mínimo para prever:** 30 minutos de histórico. Um único ponto virando em menos de uma hora também não basta, porque diz quando o ponto virou e não a que velocidade a janela anda. Até lá o cartão mostra `coletando dados`.
 - **Intervalos sem leitura:** se o Claude Code ficou fechado, o consumo do intervalo é distribuído por interpolação entre as leituras de antes e de depois.
 - **Reset da janela:** quando o percentual usado cai, o histórico daquela janela recomeça do zero.
