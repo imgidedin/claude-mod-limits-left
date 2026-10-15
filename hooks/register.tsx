@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, Register, RenderElement, RenderInput, SessionRateLimit } from 'claude-code'
 
-import type { DeviceState, LimitWindow, Peer, Sample, Spend, Spent, Windows } from '../types'
+import type { DeviceState, Hourly, LimitWindow, Peer, Sample, Spend, Spent, Windows } from '../types'
 
 // Left to right: the 5-hour window, then the weekly one.
 const KINDS = ['five_hour', 'seven_day'] as const
@@ -233,8 +233,108 @@ export const spendTurn = (held: Spend, t: number, usage: ModelUsage): Spend => {
     usage.cache_read_input_tokens * CACHE_READ_WEIGHT
   const events = addSpent(held.events, { t, tokens, weight })
   const total = held.total + weight
+  const hours = addHourly(held.hours ?? [], t, weight)
 
-  return { ...held, since: held.since ?? t, total, own: (held.own ?? held.total) + weight, events, perPoint: atLeastSinceMark(held, total) }
+  return {
+    ...held,
+    since: held.since ?? t,
+    total,
+    own: (held.own ?? held.total) + weight,
+    events,
+    hours,
+    hoursSince: held.hoursSince ?? t,
+    perPoint: atLeastSinceMark(held, total),
+  }
+}
+
+// How long the hours are kept: four of each day of the week.
+const PROFILE_DAYS = 28
+const hourOf = (t: number): number => Math.floor(t / HOUR) * HOUR
+
+const addHourly = (hours: readonly Hourly[], t: number, weight: number): Hourly[] => {
+  const hour = hourOf(t)
+  const kept = hours.filter(h => h.t > t - PROFILE_DAYS * DAY)
+  const last = kept.at(-1)
+
+  return last !== undefined && last.t === hour ? [...kept.slice(0, -1), { t: hour, weight: last.weight + weight }] : [...kept, { t: hour, weight }]
+}
+
+// The person's week as their hours taught it: for each hour of a weekday and of a weekend day,
+// in local time, the weight they spend in it on average. Each machine is averaged over the hours
+// since it began counting them, an hour with nothing on record being an hour not used, and the
+// machines add up. Undefined before any machine has a whole day on record.
+export type Profile = { weekday: number[]; weekend: number[] }
+type DayType = keyof Profile
+
+const isWeekend = (t: number): boolean => {
+  const day = new Date(t).getDay()
+
+  return day === 0 || day === 6
+}
+
+// One machine's averages, an hour of a kind of day it has not seen yet taken from the other kind.
+const machineWeek = (hours: readonly Hourly[], since: number, end: number): Profile => {
+  const from = Math.max(hourOf(since) + HOUR, end - PROFILE_DAYS * DAY)
+  const byHour = new Map(hours.filter(h => h.t >= from && h.t < end).map(h => [h.t, h.weight]))
+  const sums: Record<DayType, number[]> = { weekday: new Array(24).fill(0), weekend: new Array(24).fill(0) }
+  const counts: Record<DayType, number[]> = { weekday: new Array(24).fill(0), weekend: new Array(24).fill(0) }
+  for (let t = from; t < end; t += HOUR) {
+    const type: DayType = isWeekend(t) ? 'weekend' : 'weekday'
+    const hour = new Date(t).getHours()
+    sums[type][hour] = (sums[type][hour] ?? 0) + (byHour.get(t) ?? 0)
+    counts[type][hour] = (counts[type][hour] ?? 0) + 1
+  }
+  const average = (type: DayType, hour: number): number | undefined => {
+    const count = counts[type][hour] ?? 0
+
+    return count === 0 ? undefined : (sums[type][hour] ?? 0) / count
+  }
+  const filled = (type: DayType, other: DayType) => sums[type].map((_, hour) => average(type, hour) ?? average(other, hour) ?? 0)
+
+  return { weekday: filled('weekday', 'weekend'), weekend: filled('weekend', 'weekday') }
+}
+
+export const profile = (held: Spend, at: number): Profile | undefined => {
+  const end = hourOf(at)
+  const machines = [
+    { hours: held.hours ?? [], since: held.hoursSince },
+    ...Object.values(held.peers ?? {}).map(peer => ({ hours: peer.hours ?? [], since: peer.since })),
+  ].filter((m): m is { hours: Hourly[]; since: number } => m.since !== undefined)
+  if (!machines.some(m => end - (hourOf(m.since) + HOUR) >= DAY)) return undefined
+
+  const weeks = machines.map(m => machineWeek(m.hours, m.since, end))
+  const add = (type: DayType) => new Array(24).fill(0).map((_, hour) => weeks.reduce((sum, week) => sum + (week[type][hour] ?? 0), 0))
+
+  return { weekday: add('weekday'), weekend: add('weekend') }
+}
+
+// When the weekly window runs out, walking hour by hour from now to its reset: the pace of the
+// last hour carries the hour now and fades over the next few, and the person's week does the
+// rest. Undefined where it cannot say: no week learned yet, or no known weight of a point.
+export const runsOutAt = (kind: string, window: LimitWindow, at: number, held: Spend): { at: number } | 'never' | undefined => {
+  const perPoint = held.perPoint[kind]
+  const week = profile(held, at)
+  if (perPoint === undefined || week === undefined) return undefined
+
+  let leftWeight = Math.max(0, left(window) - (fraction(held, kind) ?? 0)) * perPoint
+  const reset = resetsIn(window, at)
+  const until = at + (Number.isNaN(reset) ? 7 * DAY : reset)
+  const now = spentIn(held, at, HOUR).weight
+  let t = at
+  for (let ahead = 0; t < until; ahead++) {
+    const next = Math.min(until, hourOf(t) + HOUR)
+    const hour = new Date(t).getHours()
+    const usual = (isWeekend(t) ? week.weekend : week.weekday)[hour] ?? 0
+    const carried = 0.5 ** ahead
+    const perHour = carried * now + (1 - carried) * usual
+    const spent = (perHour * (next - t)) / HOUR
+    // To the minute: the fading pace leaves fractions of a millisecond nobody reads.
+    if (spent >= leftWeight) return { at: Math.round((t + (perHour === 0 ? 0 : (leftWeight / perHour) * HOUR)) / MINUTE) * MINUTE }
+    leftWeight -= spent
+    t = next
+  }
+
+  return 'never'
 }
 
 // Two entries as one, at the first one's time; the dollars only where either has them.
@@ -273,7 +373,12 @@ export const takePeers = (held: Spend, devices: Readonly<Record<string, Peer>>, 
     if (device === self) continue
     const seen = held.peers?.[device]
     if (seen !== undefined) total += Math.max(0, peer.own - seen.own)
-    peers[device] = { own: peer.own, events: peer.events.filter(event => event.t > at - DAY) }
+    peers[device] = {
+      own: peer.own,
+      events: peer.events.filter(event => event.t > at - DAY),
+      hours: (peer.hours ?? []).filter(h => h.t > at - PROFILE_DAYS * DAY),
+      ...(peer.since === undefined ? {} : { since: peer.since }),
+    }
   }
 
   return { ...held, total, peers, perPoint: atLeastSinceMark(held, total) }
@@ -364,6 +469,12 @@ const resetsIn = (window: LimitWindow, at: number): number =>
 export type Outlook = { state: 'collecting' | 'ok' | 'out' } | { state: 'runsOut'; inMs: number }
 
 export const outlook = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): Outlook => {
+  if (left(window) === 0) return { state: 'out' }
+  if (kind === 'seven_day') {
+    const out = runsOutAt(kind, window, at, held)
+    if (out === 'never') return { state: 'ok' }
+    if (out !== undefined) return { state: 'runsOut', inMs: out.at - at }
+  }
   const rate = pace(kind, window, at, held)
   if (rate === undefined) return { state: 'collecting' }
   if (left(window) === 0) return { state: 'out' }
@@ -384,8 +495,13 @@ export const forecast = (kind: string, window: LimitWindow, at: number, held: Sp
 }
 
 // The 5-hour window warns when it runs out more than half an hour before it resets; the weekly
-// one when a day at that pace takes more than 15 points and it runs out before it resets.
+// one when the person's week runs it out before it resets, or, before a week is learned, when a
+// day at that pace takes more than 15 points and it runs out before it resets.
 export const isOverPace = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): boolean => {
+  if (kind === 'seven_day') {
+    const out = runsOutAt(kind, window, at, held)
+    if (out !== undefined) return out !== 'never'
+  }
   const rate = pace(kind, window, at, held)
   if (rate === undefined || rate === 0) return false
 
@@ -618,7 +734,13 @@ export const sync = async ($: EngineInterface, remote: SyncOptions, isDue: boole
   const sent = await $.store.get(SPEND_KEY)
   const sentWindows = await $.store.get(STORE_KEY)
   const mine: Spend = isSpend(sent) ? sent : NO_SPEND
-  const state: DeviceState = { own: mine.own ?? mine.total, events: mine.events, windows: isWindows(sentWindows) ? sentWindows : {} }
+  const state: DeviceState = {
+    own: mine.own ?? mine.total,
+    events: mine.events,
+    windows: isWindows(sentWindows) ? sentWindows : {},
+    hours: mine.hours ?? [],
+    ...(mine.hoursSince === undefined ? {} : { since: mine.hoursSince }),
+  }
   const response = await $.http.fetch(`${remote.url}/v1/sync`, {
     method: 'POST',
     headers: { authorization: `Bearer ${remote.token}`, 'content-type': 'application/json', 'user-agent': 'limits-left' },

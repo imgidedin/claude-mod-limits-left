@@ -77,7 +77,8 @@ const isState = body =>
   Number.isFinite(body.own) &&
   Array.isArray(body.events) &&
   typeof body.windows === 'object' &&
-  body.windows !== null
+  body.windows !== null &&
+  (body.hours === undefined || Array.isArray(body.hours))
 
 createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/healthz') return answer(res, 200, { ok: true })
@@ -94,7 +95,9 @@ createServer(async (req, res) => {
 
   const now = Date.now()
   const devices = Object.fromEntries(Object.entries(state.devices).filter(([, device]) => now - device.at < FORGET_MS))
-  devices[body.device] = { own: body.own, events: body.events, windows: body.windows, at: now }
+  // Whatever else the mod sends is kept too, so a field a newer mod adds needs no new server.
+  const { device, ...sent } = body
+  devices[device] = { ...sent, at: now }
   state = { devices }
   await save()
 

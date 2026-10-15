@@ -27,13 +27,22 @@ export type Spend = {
   own?: number
   // By device: the other machines as the last sync found them.
   peers?: Record<string, Peer>
+  // This machine's own turns, hour by hour (`t` the hour's start), for four weeks: what the
+  // forecast learns the person's week from.
+  hours?: Hourly[]
+  // When the hours began: an hour after it with nothing on record is an hour not used.
+  hoursSince?: number
 }
 
-// Another machine: the weight of its own turns, and its last day of them.
-export type Peer = { own: number; events: Spent[] }
+// The weight of one hour's turns.
+export type Hourly = { t: number; weight: number }
+
+// Another machine: the weight of its own turns, its last day of them, its hours, and since
+// when it counted those.
+export type Peer = { own: number; events: Spent[]; hours?: Hourly[]; since?: number }
 
 // What a machine sends the sync server, and what the server keeps of each.
-export type DeviceState = { own: number; events: Spent[]; windows: Windows }
+export type DeviceState = { own: number; events: Spent[]; windows: Windows; hours?: Hourly[]; since?: number }
 
 declare module 'claude-code' {
   interface PluginState {

@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { NO_SPEND, cardSvg, details, forecast, fraction, isOverPace, mergeWindows, ranges, record, spendTurn, takePeers, turnPoint, usedIn, workHours } from './register'
+import { NO_SPEND, cardSvg, details, forecast, fraction, isOverPace, mergeWindows, profile, ranges, record, runsOutAt, spendTurn, takePeers, turnPoint, usedIn, workHours } from './register'
 
 const MINUTE = 60_000
 const EMPTY = { type: 'Box' } as const
@@ -584,4 +584,57 @@ test('what the session cost goes beside the tokens, from the first measurement o
 
   const band = await $.ui.mount({ plugin: 'limits-left', surface: 'terminal', component: 'AbovePrompt', props: BAND })
   expect(JSON.stringify(await band.drawn())).toContain('1k · $0.45')
+})
+
+// A week of work from 9 to 18 on weekdays, 50 of weight an hour, from Monday 12 October 2026.
+const local = (day: number, hour: number) => new Date(2026, 9, day, hour).getTime()
+const workWeek = (untilDay: number, untilHour: number) => {
+  const hours: { t: number; weight: number }[] = []
+  for (let t = local(12, 0); t < local(untilDay, untilHour); t += 60 * MINUTE) {
+    const d = new Date(t)
+    if (d.getDay() >= 1 && d.getDay() <= 5 && d.getHours() >= 9 && d.getHours() < 18) hours.push({ t, weight: 50 })
+  }
+
+  return hours
+}
+
+test('the week is learned hour by hour, the weekend from what it saw of it', () => {
+  const held = { ...NO_SPEND, hours: workWeek(19, 20), hoursSince: local(11, 23) }
+  const week = profile(held, local(19, 20))
+  expect(week?.weekday[10]).toBe(50)
+  expect(week?.weekday[20]).toBe(0)
+  expect(week?.weekend[10]).toBe(0)
+
+  // Less than a day on record: nothing learned yet.
+  expect(profile({ ...NO_SPEND, hours: [], hoursSince: local(19, 8) }, local(19, 20))).toBe(undefined)
+})
+
+test('a machine that began counting later is not read as idle before it began', () => {
+  const work = { own: 0, events: [], hours: workWeek(19, 20), since: local(11, 23) }
+  // Home began on Saturday and spends 20 an hour from 20 to 22, weekend or not.
+  const evenings = [local(17, 20), local(17, 21), local(18, 20), local(18, 21)].map(t => ({ t, weight: 20 }))
+  const held = { ...NO_SPEND, hours: evenings, hoursSince: local(16, 23), peers: { work } }
+
+  const week = profile(held, local(19, 0))
+  expect(week?.weekday[10]).toBe(50)
+  // Home has seen no weekday yet, so its weekend stands for it.
+  expect(week?.weekday[20]).toBe(20)
+  expect(week?.weekend[21]).toBe(20)
+})
+
+test('the weekly forecast walks the person\'s week instead of using every hour of it', () => {
+  const at = local(19, 20)
+  const held = { ...NO_SPEND, hours: workWeek(19, 20), hoursSince: local(11, 23), perPoint: { seven_day: 100 } }
+  // 10 points left, a point takes 100: 1000 of weight, 450 a working day.
+  const window = { samples: [{ t: at, used: 90 }], resetsAt: new Date(local(24, 20)).toISOString() }
+
+  expect(runsOutAt('seven_day', window, at, held)).toEqual({ at: local(22, 11) })
+  expect(forecast('seven_day', window, at, held)).toBe('esgota em ~2d15h')
+  expect(isOverPace('seven_day', window, at, held)).toBe(true)
+
+  // With the reset on Wednesday night it lasts.
+  const sooner = { ...window, resetsAt: new Date(local(21, 23)).toISOString() }
+  expect(runsOutAt('seven_day', sooner, at, held)).toBe('never')
+  expect(forecast('seven_day', sooner, at, held)).toBe('✓')
+  expect(isOverPace('seven_day', sooner, at, held)).toBe(false)
 })
