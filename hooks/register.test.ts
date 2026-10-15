@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { NO_SPEND, cardSvg, details, forecast, fraction, isOverPace, record, spendTurn, turnPoint, usedIn } from './register'
+import { NO_SPEND, cardSvg, details, forecast, fraction, isOverPace, mergeWindows, ranges, record, spendTurn, takePeers, turnPoint, usedIn, workHours } from './register'
 
 const MINUTE = 60_000
 const EMPTY = { type: 'Box' } as const
@@ -65,7 +65,7 @@ test('forecast projects the pace of the last hour onto what is left', () => {
   expect(forecast('five_hour', { samples: [{ t: START, used: 10 }] }, START + MINUTE)).toBe('coletando dados')
   expect(forecast('five_hour', { samples: [{ t: START, used: 10 }] }, at)).toBe('✓')
   expect(details('five_hour', { samples }, at)).toBe(
-    'Limite de sessão · 5h: 40% usado · 15m 7.5% · 30m 15% · 1h 30% · esgota em ~2h00',
+    'Limite de sessão · 5h: 40% usado · 15m 7.5% · 30m 15% · 1h 30% · 8h–18h – · 24h – · esgota em ~2h00',
   )
 })
 
@@ -278,12 +278,12 @@ test('the card shows the estimate and the tokens beside the points', () => {
 
   // The whole-number reading did not move, and tokens went: under a point, not none.
   expect(details('seven_day', window, at, uncalibrated)).toBe(
-    'Semanal · 7d: 66% usado · 15m <1% · 200k · 30m <1% · 200k · 1h – · 200k · ✓',
+    'Semanal · 7d: 66% usado · 15m <1% · 200k · 30m <1% · 200k · 1h – · 200k · 8h–18h – · 200k · 24h – · 200k · ✓',
   )
 
   const calibrated = { ...uncalibrated, marks: { seven_day: 0 }, perPoint: { seven_day: 500_000 } }
   expect(details('seven_day', window, at, calibrated)).toBe(
-    'Semanal · 7d: ~66.4% usado · 15m ~0.4% · 200k · 30m ~0.4% · 200k · 1h ~0.4% · 200k · ✓',
+    'Semanal · 7d: ~66.4% usado · 15m ~0.4% · 200k · 30m ~0.4% · 200k · 1h ~0.4% · 200k · 8h–18h ~0.4% · 200k · 24h ~0.4% · 200k · ✓',
   )
   expect(cardSvg('seven_day', window, at, calibrated)).toContain('~66.4%')
   // The card is markup: a bare `<` in a figure would leave it undrawn.
@@ -463,4 +463,125 @@ test('the footer counts the turns past half of the point the reading is in', asy
 
   const footer = await $.ui.mount({ plugin: 'limits-left', surface: 'desktop', component: 'SessionMode', props: { modes: [] } })
   expect(await footer.find({ key: 'limits-seven_day' })).toMatchObject({ text: '  📅︎ 27%  ' })
+})
+
+test('another machine adds what it did since the last sync, and nothing the first time', () => {
+  let spend = spendTurn(NO_SPEND, START, usage(1000))
+  expect(spend.own).toBe(1000)
+
+  // Seen for the first time: its last day goes on the spans, its past not on the total.
+  const work = { own: 50_000, events: [{ t: START, tokens: 300, weight: 300 }] }
+  spend = takePeers(spend, { work, home: { own: 1, events: [] } }, 'home', START)
+  expect(spend.total).toBe(1000)
+  expect(spend.peers?.work?.events).toEqual(work.events)
+  expect(spend.peers?.home).toBe(undefined)
+
+  // 700 more there since: on the total, and never on what this machine sends as its own.
+  spend = takePeers(spend, { work: { own: 50_700, events: [] } }, 'home', START + 5 * MINUTE)
+  expect(spend.total).toBe(1700)
+  expect(spend.own).toBe(1000)
+  spend = spendTurn(spend, START + 6 * MINUTE, usage(100))
+  expect(spend.own).toBe(1100)
+  expect(spend.total).toBe(1800)
+})
+
+test('the machines readings make one history', () => {
+  const home = { samples: [{ t: START, used: 70 }, { t: START + 10 * MINUTE, used: 71 }], resetsAt: 'a' }
+  const work = { samples: [{ t: START + 5 * MINUTE, used: 70 }, { t: START + 20 * MINUTE, used: 72 }], resetsAt: 'b' }
+
+  const merged = mergeWindows([{ seven_day: home }, { seven_day: work }])
+  expect(merged.seven_day?.samples.at(-1)).toEqual({ t: START + 20 * MINUTE, used: 72 })
+  expect(merged.seven_day?.samples.map(s => s.t)).toContain(START + 10 * MINUTE)
+  // The newest reading's reset.
+  expect(merged.seven_day?.resetsAt).toBe('b')
+})
+
+test('syncs with the server named in the options, as one machine', { options: { syncUrl: 'https://limits.test/', syncToken: 'k' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  mock.store(on, {
+    device: 'home',
+    windows: { seven_day: { samples: [{ t: START - MINUTE, used: 70 }] } },
+    spend: { total: 1000, own: 1000, events: [], marks: { seven_day: 0 }, perPoint: { seven_day: 2000 } },
+  })
+  on('session.start', (_, e) => e)
+  on('command.register', () => ({ value: undefined }))
+  const sent: { url: string; auth?: string; body: { device: string; own: number } }[] = []
+  let workOwn = 9000
+  on('http.fetch', (_, e) => {
+    sent.push({ url: e.url, auth: e.init?.headers?.authorization, body: JSON.parse(e.init?.body ?? '{}') })
+    const work = { own: workOwn, events: [], windows: { seven_day: { samples: [{ t: clock.now(), used: 71 }] } } }
+
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ devices: { home: sent.at(-1)?.body, work } }) } }
+  })
+
+  await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
+  await clock.advance(0)
+  expect(sent[0]).toMatchObject({ url: 'https://limits.test/v1/sync', auth: 'Bearer k', body: { device: 'home', own: 1000 } })
+
+  // The work machine's reading of 71 turned a point here; its 9000 so far are not counted.
+  const footer = await $.ui.mount({ plugin: 'limits-left', surface: 'desktop', component: 'SessionMode', props: { modes: [] } })
+  expect(await footer.find({ key: 'limits-seven_day' })).toMatchObject({ text: '  📅︎ 29%  ' })
+
+  // Five minutes on, 1000 more there: the next sync counts them, and only one machine sends.
+  workOwn = 10_000
+  await clock.advance(5 * MINUTE)
+  expect(sent.length).toBe(2)
+  expect(sent[1]?.body.own).toBe(1000)
+})
+
+test('the working day reads as the option writes it, and falls back to 8 to 18', () => {
+  expect(workHours('9-17')).toEqual({ start: 540, end: 1020 })
+  expect(workHours(' 08:30 - 17:45 ')).toEqual({ start: 510, end: 1065 })
+  expect(workHours('18-8')).toEqual({ start: 480, end: 1080 })
+  expect(workHours('manhã')).toEqual({ start: 480, end: 1080 })
+  expect(workHours(undefined)).toEqual({ start: 480, end: 1080 })
+})
+
+test('the working day is today once it began, cut at now, and yesterday before it', () => {
+  const work = { start: 8 * 60, end: 18 * 60 }
+  const at = (h: number, m = 0) => new Date(2026, 9, 15, h, m).getTime()
+
+  const midday = ranges(at(13, 20), work)
+  expect(midday.map(r => r.label)).toEqual(['15m', '30m', '1h', '8h–18h', '24h'])
+  expect(midday[3]).toMatchObject({ title: 'Hoje, 8h–18h', from: at(8), to: at(13, 20) })
+  expect(midday[4]).toMatchObject({ title: 'Últimas 24 horas', from: at(13, 20) - 24 * 60 * MINUTE })
+
+  expect(ranges(at(21), work)[3]).toMatchObject({ title: 'Hoje, 8h–18h', from: at(8), to: at(18) })
+  expect(ranges(at(7), work)[3]).toMatchObject({ title: 'Ontem, 8h–18h', from: new Date(2026, 9, 14, 8).getTime(), to: new Date(2026, 9, 14, 18).getTime() })
+  expect(ranges(at(13), { start: 510, end: 1065 })[3]?.label).toBe('8h30–17h45')
+})
+
+test('the working day and the last 24 hours count the turns in them', () => {
+  const day = (h: number) => new Date(2026, 9, 15, h).getTime()
+  let spend = turnPoint(NO_SPEND, 'seven_day', 60, 61)
+  spend = spendTurn(spend, day(7), usage(1000))
+  spend = turnPoint(spend, 'seven_day', 61, 62)
+  spend = spendTurn(spend, day(9), usage(500))
+  spend = spendTurn(spend, day(19), usage(250))
+  const window = { samples: [{ t: day(7), used: 61 }, { t: day(8), used: 62 }, { t: day(20), used: 62 }] }
+
+  // A point takes 1000: 500 in the working day, 1750 in the last 24 hours.
+  const line = details('seven_day', window, day(20), spend, { start: 8 * 60, end: 18 * 60 })
+  expect(line).toContain('8h–18h ~0.5% · 500')
+  expect(line).toContain('24h ~1.8% · 1.8k')
+})
+
+test('what the session cost goes beside the tokens, from the first measurement on', async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  mock.store(on, { windows: { seven_day: { samples: [{ t: START, used: 60 }] } } })
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('turn.complete', () => ({ text: '' }))
+  on('ui.render', () => EMPTY)
+  const cost = (usd: number) =>
+    $.session.measure({ context: { window: 200000 }, rateLimits: [{ kind: 'seven_day', percentUsed: 60 }], cost: { usd }, changed: ['cost'] } as never)
+
+  // The ledger already stood at $3 when the mod first saw it: that is not counted.
+  await cost(3)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer', usage: { ...usage(1000), model: 'm' } } as never)
+  await clock.advance(MINUTE)
+  await cost(3.45)
+  await $.command.run({ command: 'limits', args: '' } as never)
+
+  const band = await $.ui.mount({ plugin: 'limits-left', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+  expect(JSON.stringify(await band.drawn())).toContain('1k · $0.45')
 })

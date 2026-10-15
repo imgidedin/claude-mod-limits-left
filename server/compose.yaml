@@ -1,0 +1,25 @@
+# Stack for Portainer (Stacks > Add stack > Repository, compose path server/compose.yaml).
+# Environment variables: TOKEN, the key the mod sends (16 characters at least), and
+# NPM_NETWORK, the Docker network Nginx Proxy Manager is on. No port is published: the proxy
+# reaches the service as limits-left-sync:8080 over that network.
+services:
+  limits-left-sync:
+    build: .
+    environment:
+      TOKEN: ${TOKEN:?set TOKEN, 16 characters at least}
+    volumes:
+      - limits-left-data:/data
+    networks:
+      - proxy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 1m
+
+volumes:
+  limits-left-data:
+
+networks:
+  proxy:
+    external: true
+    name: ${NPM_NETWORK:?set NPM_NETWORK, the network Nginx Proxy Manager is on}

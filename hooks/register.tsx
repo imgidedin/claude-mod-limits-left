@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, Register, RenderElement, RenderInput, SessionRateLimit } from 'claude-code'
 
-import type { LimitWindow, Sample, Spend, Spent, Windows } from '../types'
+import type { DeviceState, LimitWindow, Peer, Sample, Spend, Spent, Windows } from '../types'
 
 // Left to right: the 5-hour window, then the weekly one.
 const KINDS = ['five_hour', 'seven_day'] as const
@@ -10,10 +10,53 @@ const MINUTE = 60_000
 const HOUR = 60 * MINUTE
 const DAY = 24 * HOUR
 const SPANS = [
-  { label: '15m', ms: 15 * MINUTE },
-  { label: '30m', ms: 30 * MINUTE },
-  { label: '1h', ms: HOUR },
+  { label: '15m', title: 'Últimos 15 min', ms: 15 * MINUTE },
+  { label: '30m', title: 'Últimos 30 min', ms: 30 * MINUTE },
+  { label: '1h', title: 'Última hora', ms: HOUR },
 ] as const
+
+// A working day, in minutes after local midnight.
+export type WorkHours = { start: number; end: number }
+export const DEFAULT_WORK: WorkHours = { start: 8 * 60, end: 18 * 60 }
+
+// `8-18` or `08:30-17:45`, as the option is written; the default where it does not read as a day.
+export const workHours = (text: unknown): WorkHours => {
+  const match = typeof text === 'string' ? /^\s*(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?\s*$/.exec(text) : null
+  if (match === null) return DEFAULT_WORK
+  const start = Number(match[1]) * 60 + Number(match[2] ?? 0)
+  const end = Number(match[3]) * 60 + Number(match[4] ?? 0)
+
+  return start < end && end <= 24 * 60 ? { start, end } : DEFAULT_WORK
+}
+
+const clock = (minutes: number): string => {
+  const m = minutes % 60
+
+  return m === 0 ? `${Math.floor(minutes / 60)}h` : `${Math.floor(minutes / 60)}h${String(m).padStart(2, '0')}`
+}
+
+// A stretch the cards count what went in: its short label, its title, and its ends.
+export type Range = { label: string; title: string; from: number; to: number }
+
+// The last 15 minutes, 30 minutes and hour; the working day, today's once it began and
+// yesterday's before; and the last 24 hours. Local time, as the person reads a clock.
+export const ranges = (at: number, work: WorkHours = DEFAULT_WORK): Range[] => {
+  const midnight = new Date(at)
+  midnight.setHours(0, 0, 0, 0)
+  const startToday = new Date(midnight).setMinutes(work.start)
+  const isToday = at >= startToday
+  const day = new Date(midnight)
+  if (!isToday) day.setDate(day.getDate() - 1)
+  const from = new Date(day).setMinutes(work.start)
+  const to = Math.min(at, new Date(day).setMinutes(work.end))
+  const hours = `${clock(work.start)}–${clock(work.end)}`
+
+  return [
+    ...SPANS.map(({ label, title, ms }) => ({ label, title, from: at - ms, to: at })),
+    { label: hours, title: `${isToday ? 'Hoje' : 'Ontem'}, ${hours}`, from, to },
+    { label: '24h', title: 'Últimas 24 horas', from: at - DAY, to: at },
+  ]
+}
 
 // The shortest stretch of history a pace is estimated from.
 const MIN_PACE_MS = 30 * MINUTE
@@ -85,6 +128,9 @@ const now = atom({ plugin: 'limits-left', key: 'now' } as const, 0)
 const isOpen = atom({ plugin: 'limits-left', key: 'isOpen' } as const, false)
 export const NO_SPEND: Spend = { total: 0, events: [], marks: {}, perPoint: {} }
 const spend = atom({ plugin: 'limits-left', key: 'spend' } as const, NO_SPEND)
+// What this session's cost ledger stood at when last measured; -1 until the first measurement,
+// which sets where the counting starts.
+const seenUsd = atom({ plugin: 'limits-left', key: 'seenUsd' } as const, -1)
 // The desktop's button has no padding of its own and takes none: no-break spaces stand in.
 const PAD = '\u00A0\u00A0'
 const COMMAND = 'limits'
@@ -120,6 +166,14 @@ const usedAt = (samples: readonly Sample[], at: number): number | undefined => {
   if (next === undefined) return prev.used
 
   return prev.used + ((next.used - prev.used) * (at - prev.t)) / (next.t - prev.t)
+}
+
+// Points of the window used between two times; undefined where the history does not reach.
+const usedBetween = (samples: readonly Sample[], from: number, to: number): number | undefined => {
+  const base = usedAt(samples, from)
+  const last = usedAt(samples, to)
+
+  return base === undefined || last === undefined ? undefined : Math.max(0, round1(last - base))
 }
 
 // Points of the window used in the `span` before `at`.
@@ -177,24 +231,69 @@ export const spendTurn = (held: Spend, t: number, usage: ModelUsage): Spend => {
     usage.output_tokens * OUTPUT_WEIGHT +
     usage.cache_creation_input_tokens * CACHE_WRITE_WEIGHT +
     usage.cache_read_input_tokens * CACHE_READ_WEIGHT
-  // The last hour a minute apart, for the cards' spans; the rest of the day further apart.
-  const recent = held.events
-    .filter(event => event.t > t - DAY)
-    .reduce<Spent[]>((kept, event) => {
-      const prev = kept.at(-1)
-      if (prev === undefined || event.t > t - HOUR || event.t - prev.t >= OLD_ENTRY_MS) return [...kept, event]
-
-      return [...kept.slice(0, -1), { t: prev.t, tokens: prev.tokens + event.tokens, weight: prev.weight + event.weight }]
-    }, [])
-  const last = recent.at(-1)
-  const events =
-    last !== undefined && t - last.t < MINUTE
-      ? [...recent.slice(0, -1), { t: last.t, tokens: last.tokens + tokens, weight: last.weight + weight }]
-      : [...recent, { t, tokens, weight }]
-
+  const events = addSpent(held.events, { t, tokens, weight })
   const total = held.total + weight
 
-  return { ...held, since: held.since ?? t, total, events, perPoint: atLeastSinceMark(held, total) }
+  return { ...held, since: held.since ?? t, total, own: (held.own ?? held.total) + weight, events, perPoint: atLeastSinceMark(held, total) }
+}
+
+// Two entries as one, at the first one's time; the dollars only where either has them.
+const joinSpent = (a: Spent, b: Spent): Spent => {
+  const joined = { t: a.t, tokens: a.tokens + b.tokens, weight: a.weight + b.weight }
+
+  return a.usd === undefined && b.usd === undefined ? joined : { ...joined, usd: (a.usd ?? 0) + (b.usd ?? 0) }
+}
+
+// Adds an entry, keeping the last hour a minute apart, for the cards' spans, and the rest of
+// the day further apart.
+const addSpent = (events: readonly Spent[], entry: Spent): Spent[] => {
+  const recent = events
+    .filter(event => event.t > entry.t - DAY)
+    .reduce<Spent[]>((kept, event) => {
+      const prev = kept.at(-1)
+      if (prev === undefined || event.t > entry.t - HOUR || event.t - prev.t >= OLD_ENTRY_MS) return [...kept, event]
+
+      return [...kept.slice(0, -1), joinSpent(prev, event)]
+    }, [])
+  const last = recent.at(-1)
+
+  return last !== undefined && entry.t - last.t < MINUTE ? [...recent.slice(0, -1), joinSpent(last, entry)] : [...recent, entry]
+}
+
+// What a session's ledger grew by goes on the minute it was measured in, beside the tokens.
+export const spendCost = (held: Spend, t: number, usd: number): Spend =>
+  usd <= 0 ? held : { ...held, events: addSpent(held.events, { t, tokens: 0, weight: 0, usd }) }
+
+// What the other machines did since the last sync goes on the count as this machine's turns
+// do; a machine seen for the first time adds its last day to the spans and nothing to the total.
+export const takePeers = (held: Spend, devices: Readonly<Record<string, Peer>>, self: string, at: number): Spend => {
+  let total = held.total
+  const peers: Record<string, Peer> = {}
+  for (const [device, peer] of Object.entries(devices)) {
+    if (device === self) continue
+    const seen = held.peers?.[device]
+    if (seen !== undefined) total += Math.max(0, peer.own - seen.own)
+    peers[device] = { own: peer.own, events: peer.events.filter(event => event.t > at - DAY) }
+  }
+
+  return { ...held, total, peers, perPoint: atLeastSinceMark(held, total) }
+}
+
+// Every machine's readings of the windows as one history, as `record` keeps it.
+export const mergeWindows = (all: readonly Windows[]): Windows => {
+  const merged: Windows = {}
+  for (const kind of new Set(all.flatMap(windows => Object.keys(windows)))) {
+    const held = all.flatMap(windows => (windows[kind] === undefined ? [] : [windows[kind]]))
+    const samples = held
+      .flatMap(window => window.samples)
+      .sort((a, b) => a.t - b.t)
+      .reduce<Sample[]>((kept, s) => record(kept, s.t, s.used, historyOf(kind)), [])
+    // The reset is the one the newest reading came with.
+    const newest = held.reduce((a, b) => ((b.samples.at(-1)?.t ?? 0) > (a.samples.at(-1)?.t ?? 0) ? b : a))
+    merged[kind] = newest.resetsAt === undefined ? { samples } : { samples, resetsAt: newest.resetsAt }
+  }
+
+  return merged
 }
 
 // A point takes at least what went by since its reading turned and it has not turned again:
@@ -235,10 +334,20 @@ export const fraction = (held: Spend, kind: string): number | undefined => {
   return Math.min(MAX_FRACTION, Math.floor(((held.total - mark) / perPoint) * 10) / 10)
 }
 
-const spentIn = (held: Spend, at: number, span: number): { tokens: number; weight: number } =>
-  held.events
-    .filter(event => event.t > at - span)
-    .reduce((sum, event) => ({ tokens: sum.tokens + event.tokens, weight: sum.weight + event.weight }), { tokens: 0, weight: 0 })
+const spentIn = (held: Spend, at: number, span: number): { tokens: number; weight: number } => spentBetween(held, at - span, at)
+
+const allSpent = (held: Spend): Spent[] => [...held.events, ...Object.values(held.peers ?? {}).flatMap(peer => peer.events)]
+
+const spentBetween = (held: Spend, from: number, to: number): { tokens: number; weight: number; usd: number } =>
+  allSpent(held)
+    .filter(event => event.t > from && event.t <= to)
+    .reduce(
+      (sum, event) => ({ tokens: sum.tokens + event.tokens, weight: sum.weight + event.weight, usd: sum.usd + (event.usd ?? 0) }),
+      { tokens: 0, weight: 0, usd: 0 },
+    )
+
+// Dollars as the status line writes them: cents below a hundred, whole dollars above.
+const dollars = (usd: number): string => (usd < 100 ? `$${usd.toFixed(2)}` : `$${Math.round(usd)}`)
 
 const compact = (tokens: number): string => {
   if (tokens < 1000) return String(tokens)
@@ -298,7 +407,6 @@ const SHORT_TITLES: Record<string, string> = { five_hour: '5h', seven_day: '7d' 
 // before it, so it is kept short.
 export const warning = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): string =>
   `${SHORT_TITLES[kind] ?? kind} acima do ritmo · ${forecast(kind, window, at, held)}`
-const SPAN_TITLES = ['Últimos 15 min', 'Últimos 30 min', 'Última hora'] as const
 
 const usedOf = (window: LimitWindow): number => round1(100 - left(window))
 
@@ -315,15 +423,17 @@ const resetLine = (window: LimitWindow, at: number): string => {
   return untilReset > 0 ? `Reinicia em ${duration(untilReset)}` : ''
 }
 
-// The spans' figures, in SPANS' order: the points of the window and, once a turn is on record,
+// The ranges' rows, in their order: the points of the window and, once a turn is on record,
 // the tokens (`~0.4% · 182k`). The points are the turns' estimate where a point's weight is
 // known, the readings' otherwise: a dash where the history does not reach, and `<1%` where
 // tokens went and the whole-number reading did not move.
-const spanFigures = (kind: string, window: LimitWindow, at: number, held: Spend): string[] =>
-  SPANS.map(({ ms }) => {
-    const { tokens, weight } = spentIn(held, at, ms)
+const spanFigures = (kind: string, window: LimitWindow, at: number, held: Spend, work?: WorkHours): (Range & { figure: string })[] => {
+  const hasCost = allSpent(held).some(event => event.usd !== undefined)
+
+  return ranges(at, work).map(range => {
+    const { tokens, weight, usd } = spentBetween(held, range.from, range.to)
     const perPoint = held.perPoint[kind]
-    const used = usedIn(window.samples, at, ms)
+    const used = range.to <= range.from ? 0 : usedBetween(window.samples, range.from, range.to)
     const points =
       perPoint !== undefined
         ? `~${round1(weight / perPoint)}%`
@@ -333,15 +443,19 @@ const spanFigures = (kind: string, window: LimitWindow, at: number, held: Spend)
             ? '<1%'
             : `${used}%`
 
-    return held.total === 0 ? points : `${points} · ${compact(tokens)}`
+    // The dollars once a ledger has reported any: none at all reads as a host that keeps none.
+    const cost = hasCost ? ` · ${dollars(usd)}` : ''
+
+    return { ...range, figure: held.total === 0 ? `${points}${cost}` : `${points} · ${compact(tokens)}${cost}` }
   })
+}
 
 // One line of it all, for a reader that cannot see the card.
-export const details = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): string =>
+export const details = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND, work?: WorkHours): string =>
   [
     `${TITLES[kind] ?? kind}: ${usedLabel(kind, window, held)} usado`,
     resetLine(window, at),
-    ...spanFigures(kind, window, at, held).map((figure, i) => `${SPANS[i]?.label} ${figure}`),
+    ...spanFigures(kind, window, at, held, work).map(row => `${row.label} ${row.figure}`),
     forecast(kind, window, at, held),
   ]
     .filter(part => part !== '')
@@ -351,7 +465,11 @@ export const details = (kind: string, window: LimitWindow, at: number, held: Spe
 const escapeXml = (text: string): string => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
 const CARD_W = 300
-const CARD_H = 150
+const ROWS_Y = 68
+const ROW_H = 20
+// Below the rows: a rule, then the forecast.
+const RULE_Y = ROWS_Y + (SPANS.length + 2) * ROW_H - 10
+const CARD_H = RULE_Y + 32
 const FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif"
 const CARD_CSS = `<style>
 text{font-family:${FONT};font-size:12px}
@@ -362,22 +480,22 @@ text{font-family:${FONT};font-size:12px}
 
 // The card a hover shows on a surface that draws pixels: the window as the app's own usage
 // card has it, then what the last 15 minutes, 30 minutes and hour took, and where that leads.
-export const cardSvg = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): string => {
+export const cardSvg = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND, work?: WorkHours): string => {
   const right = CARD_W - 14
   const o = outlook(kind, window, at, held)
   const used = Math.min(100, usedOf(window) + (fraction(held, kind) ?? 0))
-  const rows = spanFigures(kind, window, at, held)
-    .map((figure, i) => {
-      const y = 68 + i * 20
+  const rows = spanFigures(kind, window, at, held, work)
+    .map((row, i) => {
+      const y = ROWS_Y + i * ROW_H
 
-      return `<text class="s" x="14" y="${y}">${SPAN_TITLES[i]}</text><text class="t" x="${right}" y="${y}" text-anchor="end">${escapeXml(figure)}</text>`
+      return `<text class="s" x="14" y="${y}">${row.title}</text><text class="t" x="${right}" y="${y}" text-anchor="end">${escapeXml(row.figure)}</text>`
     })
     .join('')
   // Fine is a green check and nothing to read.
   const verdict =
     o.state === 'ok'
-      ? `<path class="ok" d="M${right - 12} 131l4 4 8-9" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`
-      : `<text class="${o.state === 'collecting' ? 's' : 'bad'}" x="${right}" y="136" text-anchor="end">${forecast(kind, window, at, held)}</text>`
+      ? `<path class="ok" d="M${right - 12} ${RULE_Y + 13}l4 4 8-9" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`
+      : `<text class="${o.state === 'collecting' ? 's' : 'bad'}" x="${right}" y="${RULE_Y + 18}" text-anchor="end">${forecast(kind, window, at, held)}</text>`
 
   return [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${CARD_W}" height="${CARD_H}" viewBox="0 0 ${CARD_W} ${CARD_H}">`,
@@ -388,8 +506,8 @@ export const cardSvg = (kind: string, window: LimitWindow, at: number, held: Spe
     `<rect class="k" x="14" y="34" width="${CARD_W - 28}" height="4" rx="2"/>`,
     `<rect class="bar" x="14" y="34" width="${round1(((CARD_W - 28) * used) / 100)}" height="4" rx="2"/>`,
     rows,
-    `<line class="ln" x1="14" y1="118" x2="${right}" y2="118"/>`,
-    `<text class="s" x="14" y="136">No ritmo atual</text>`,
+    `<line class="ln" x1="14" y1="${RULE_Y}" x2="${right}" y2="${RULE_Y}"/>`,
+    `<text class="s" x="14" y="${RULE_Y + 18}">No ritmo atual</text>`,
     verdict,
     '</svg>',
   ].join('')
@@ -457,6 +575,79 @@ const refresh = async ($: EngineInterface): Promise<void> => {
   await update($, now, () => t)
 }
 
+// How often a machine syncs with the server, whichever of its sessions does it.
+const SYNC_MS = 5 * MINUTE
+const DEVICE_KEY = 'device'
+const SYNCED_KEY = 'syncedAt'
+
+export type SyncOptions = { url: string; token: string }
+
+// The server and its key from the plugin's options; no sync until both are set.
+export const syncOptions = (options: unknown): SyncOptions | undefined => {
+  const set = (typeof options === 'object' && options !== null ? options : {}) as Record<string, unknown>
+  const url = typeof set.syncUrl === 'string' ? set.syncUrl.trim().replace(/\/+$/, '') : ''
+  const token = typeof set.syncToken === 'string' ? set.syncToken.trim() : ''
+
+  return url === '' || token === '' ? undefined : { url, token }
+}
+
+const isDevices = (value: unknown): value is Record<string, DeviceState> =>
+  typeof value === 'object' &&
+  value !== null &&
+  Object.values(value).every(
+    device =>
+      typeof device === 'object' &&
+      device !== null &&
+      typeof (device as DeviceState).own === 'number' &&
+      Array.isArray((device as DeviceState).events) &&
+      isWindows((device as DeviceState).windows),
+  )
+
+// Sends this machine's own turns and readings to the server and takes up the other machines'.
+// The sessions of a machine share the store, so one of them does it every SYNC_MS.
+export const sync = async ($: EngineInterface, remote: SyncOptions, isDue: boolean = false): Promise<void> => {
+  const t = await $.clock.now()
+  const last = await $.store.get(SYNCED_KEY)
+  if (!isDue && typeof last === 'number' && t - last < SYNC_MS) return
+  await $.store.set(SYNCED_KEY, t)
+
+  const stored = await $.store.get(DEVICE_KEY)
+  const device = typeof stored === 'string' ? stored : `${Math.random().toString(36).slice(2, 10)}${t.toString(36)}`
+  if (device !== stored) await $.store.set(DEVICE_KEY, device)
+
+  const sent = await $.store.get(SPEND_KEY)
+  const sentWindows = await $.store.get(STORE_KEY)
+  const mine: Spend = isSpend(sent) ? sent : NO_SPEND
+  const state: DeviceState = { own: mine.own ?? mine.total, events: mine.events, windows: isWindows(sentWindows) ? sentWindows : {} }
+  const response = await $.http.fetch(`${remote.url}/v1/sync`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${remote.token}`, 'content-type': 'application/json', 'user-agent': 'limits-left' },
+    body: JSON.stringify({ device, ...state }),
+  })
+  if (!response.ok) throw new Error(`o servidor respondeu ${response.status}`)
+  const answer = JSON.parse(response.text) as { devices?: unknown }
+  if (!isDevices(answer.devices)) throw new Error('o servidor respondeu algo que não é a lista de máquinas')
+  const others = Object.entries(answer.devices).filter(([id]) => id !== device)
+
+  // Read again: a turn or a reading may have landed while the request was out.
+  const spent = await $.store.get(SPEND_KEY)
+  const held = await $.store.get(STORE_KEY)
+  const before: Windows = isWindows(held) ? held : {}
+  const merged = mergeWindows([before, ...others.map(([, other]) => other.windows)])
+  let counted = takePeers(isSpend(spent) ? spent : NO_SPEND, Object.fromEntries(others), device, t)
+  // A point another machine saw turn is a point turned here too.
+  for (const kind of KINDS) {
+    const from = before[kind]?.samples.at(-1)?.used
+    const to = merged[kind]?.samples.at(-1)?.used
+    if (from !== undefined && to !== undefined && to !== from) counted = turnPoint(counted, kind, from, to)
+  }
+
+  await $.store.set(STORE_KEY, merged)
+  await $.store.set(SPEND_KEY, counted)
+  await update($, windows, () => merged)
+  await update($, spend, () => counted)
+}
+
 // The person's own notification where a terminal takes it; a toast where none does, as on the
 // desktop, which has no terminal to write it to.
 const warn = async ($: EngineInterface, text: string): Promise<void> => {
@@ -466,7 +657,7 @@ const warn = async ($: EngineInterface, text: string): Promise<void> => {
 
 // The cards, one per window, with him beside them while a window is over pace. They keep to
 // the band's right end, over the footer's buttons that put them up.
-const drawCards = async ($: EngineInterface, e: RenderInput): Promise<RenderElement | undefined> => {
+const drawCards = async ($: EngineInterface, e: RenderInput, work: WorkHours): Promise<RenderElement | undefined> => {
   const { shown, at, held } = await gather($)
   if (shown.length === 0) return undefined
 
@@ -486,19 +677,19 @@ const drawCards = async ($: EngineInterface, e: RenderInput): Promise<RenderElem
       )}
       {shown.map(({ kind, window }) =>
         hasPixels ? (
-          // No size of its own: the markup's 300 by 150, shrunk to fit a narrower band.
-          <ui.Svg key={kind} source={cardSvg(kind, window, at, held)} alt={details(kind, window, at, held)} />
+          // No size of its own: the markup's 300 wide, shrunk to fit a narrower band.
+          <ui.Svg key={kind} source={cardSvg(kind, window, at, held, work)} alt={details(kind, window, at, held, work)} />
         ) : (
-          <Box key={kind} flexDirection="column" width={40} borderStyle="round" paddingX={1}>
+          <Box key={kind} flexDirection="column" width={46} borderStyle="round" paddingX={1}>
             <Box justifyContent="space-between">
               <Text bold>{TITLES[kind] ?? kind}</Text>
               <Text>{usedLabel(kind, window, held)}</Text>
             </Box>
             <Text dimColor>{resetLine(window, at)}</Text>
-            {spanFigures(kind, window, at, held).map((figure, i) => (
+            {spanFigures(kind, window, at, held, work).map(row => (
               <Box justifyContent="space-between">
-                <Text dimColor>{SPAN_TITLES[i]}</Text>
-                <Text>{figure}</Text>
+                <Text dimColor>{row.title}</Text>
+                <Text>{row.figure}</Text>
               </Box>
             ))}
             <Box justifyContent="space-between">
@@ -513,7 +704,22 @@ const drawCards = async ($: EngineInterface, e: RenderInput): Promise<RenderElem
   )
 }
 
-export const register: Register = on => {
+// Said once a load: a server that is down is down for every tick after.
+let hasSyncFailed = false
+
+const syncNow = async ($: EngineInterface, remote: SyncOptions | undefined, isDue?: boolean): Promise<void> => {
+  if (remote === undefined) return
+  await sync($, remote, isDue).catch((error: unknown) => {
+    if (hasSyncFailed) return
+    hasSyncFailed = true
+    $.ui.toast(`sincronização falhou: ${error instanceof Error ? error.message : String(error)}`, { timeoutMs: WARNING_MS })
+  })
+}
+
+export const register: Register = (on, options) => {
+  const remote = syncOptions(options)
+  const work = workHours((options as Record<string, unknown> | undefined)?.workHours)
+
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     const stored = await $.store.get(STORE_KEY)
@@ -529,8 +735,9 @@ export const register: Register = on => {
     // "The last 15 minutes" moves on while no reading arrives, and a session that makes no call
     // of its own takes up the readings the others put in the store.
     $.clock.every(MINUTE, () => {
-      void refresh($)
+      void refresh($).then(() => syncNow($, remote))
     })
+    void syncNow($, remote, true)
 
     return started
   })
@@ -546,6 +753,14 @@ export const register: Register = on => {
     const counted: Spend = isSpend(spent) ? spent : NO_SPEND
     let turned = counted
     const warnings: string[] = []
+    // The ledger is this session's alone and only grows: what it grew by since the last
+    // measurement is what this session's calls cost.
+    const usd = e.cost?.usd
+    if (usd !== undefined) {
+      const seen = await read($, seenUsd)
+      if (seen >= 0 && usd > seen) turned = spendCost(turned, t, usd - seen)
+      await update($, seenUsd, () => usd)
+    }
 
     for (const limit of fresh) {
       const known = held[limit.kind]
@@ -564,10 +779,12 @@ export const register: Register = on => {
 
     if (fresh.length > 0) {
       await $.store.set(STORE_KEY, merged)
-      if (turned !== counted) await $.store.set(SPEND_KEY, turned)
       await update($, windows, () => merged)
-      await update($, spend, () => turned)
       await update($, now, () => t)
+    }
+    if (turned !== counted) {
+      await $.store.set(SPEND_KEY, turned)
+      await update($, spend, () => turned)
     }
     for (const text of warnings) void warn($, text)
 
@@ -637,7 +854,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     // Another mod's band beneath this one keeps its rows; this one goes under them.
     const beneath = await next(e)
-    const cards = e.props.hasSurvey || !(await read($, isOpen)) ? undefined : await drawCards($, e)
+    const cards = e.props.hasSurvey || !(await read($, isOpen)) ? undefined : await drawCards($, e, work)
     if (cards === undefined) return beneath
 
     const { Box } = $.ui.resolve(e)

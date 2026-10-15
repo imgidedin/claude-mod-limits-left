@@ -17,7 +17,7 @@ acompanha o seu ritmo de consumo e avisa antes de você ficar sem cota.
 
 - **Mostra o que resta, não o que foi gasto.** No rodapé do prompt, ao lado do seletor de modelo: `🕐 61%` para a janela de 5 horas e `📅 34%` para a semanal.
 - **Guarda o histórico de consumo.** Uma amostra por minuto de cada janela, compartilhada entre todas as suas sessões e mantida entre reinícios.
-- **Calcula o seu ritmo.** Quanto você usou nos últimos 15 minutos, 30 minutos e na última hora, em pontos da janela e em tokens, e se nesse ritmo a cota acaba antes do reset.
+- **Calcula o seu ritmo.** Quanto você usou nos últimos 15 minutos, 30 minutos, na última hora, no seu horário de trabalho de hoje e nas últimas 24 horas, em pontos da janela e em tokens, e se nesse ritmo a cota acaba antes do reset.
 - **Estima a casa decimal.** As leituras chegam em pontos inteiros; o mod conta os tokens dos seus turnos para estimar onde você está dentro do ponto atual (`~66.4%`).
 - **Avisa quando o ritmo está alto demais.** Um `🛑` aparece ao lado da janela em risco, e o Claude em pânico aparece junto dos cartões. Na leitura em que a janela passa do ritmo, um aviso diz qual foi e em quanto tempo ela esgota: notificação do sistema no terminal, toast no app desktop.
 
@@ -80,6 +80,8 @@ No terminal, o rodapé é uma linha de texto (`◷ 61% · ▦ 34%`) e os cartõe
 
 - **Cabeçalho:** a janela, quanto falta para reiniciar e o percentual já usado, com a barra de progresso. Um `~` na frente marca uma estimativa.
 - **Últimos 15 min, 30 min e última hora:** quantos pontos percentuais da janela foram consumidos em cada período e quantos tokens os seus turnos gastaram nele (`~0.4% · 42k`). Um traço (`–`) significa que o histórico ainda não cobre aquele período, e `<1%` que houve tokens mas a leitura ainda não virou um ponto.
+- **Custo (`$0.45`):** ao lado dos tokens, quanto as chamadas daquele período custariam pela tabela de preços da API, o mesmo valor que o `/cost` e a status line somam. Numa assinatura (Pro, Max) não é o que você paga, mas dá a medida do quanto usou. Conta a partir do momento em que o mod começa a acompanhar cada sessão.
+- **Hoje, 8h–18h e últimas 24 horas:** o mesmo para o seu horário de trabalho de hoje (até agora, ou o de ontem antes de ele começar) e para o último dia. O horário é a opção `workHours`, `8-18` por padrão; escreva `9-17` ou `08:30-17:45` para mudar, com `claude plugin configure limits-left@claude-mod-limits-left`.
 - **No ritmo atual:** um ✓ verde se a cota aguenta até o reset, ou `esgota em ~2h00` em vermelho se não aguenta.
 
 ### Quando o aviso aparece
@@ -119,6 +121,30 @@ As leituras chegam em pontos inteiros, então sozinhas elas não dizem quanto vo
 - **Limite do erro:** a estimativa nunca passa de 0,9 dentro do ponto atual e é corrigida a cada virada. Uso fora das sessões com o mod (o chat do claude.ai, outras máquinas) não é contado, e faz o ponto virar antes do previsto.
 
 Na janela de 7 dias o ritmo é medido sobre um dia inteiro, então o aviso semanal leva algumas horas para reagir a um pico de uso. Ele exige também que a cota acabe antes do reset.
+
+## Sincronizar várias máquinas
+
+Cada máquina só enxerga o uso das próprias sessões. Com um servidor de sincronização, as máquinas (casa e trabalho, por exemplo) juntam a contagem de tokens e o histórico das leituras, e o peso de um ponto, a estimativa dentro do ponto e o ritmo passam a contar o uso de todas.
+
+O mod envia a cada 5 minutos só números: as leituras das janelas, com horário, e a contagem de tokens por minuto. Nenhum conteúdo de conversa sai da máquina. Sem servidor configurado, ou com ele fora do ar, tudo segue funcionando só local.
+
+### O servidor
+
+Fica em [`server/`](server/): um container Node sem dependências que guarda tudo num arquivo JSON num volume.
+
+No Portainer: **Stacks › Add stack › Repository**, com este repositório e o caminho `server/compose.yaml`. Em **Environment variables**, defina `TOKEN` com uma chave longa e aleatória (16 caracteres no mínimo), por exemplo a saída de `openssl rand -hex 32`, e `NPM_NETWORK` com a rede Docker do seu proxy reverso. O serviço não publica porta: o proxy chega nele como `limits-left-sync:8080` por essa rede.
+
+Coloque-o atrás de HTTPS: a chave vai no cabeçalho de cada requisição.
+
+### Em cada máquina
+
+Num terminal, troque o endereço pelo do seu servidor, rode o comando e cole a chave (a mesma do `TOKEN`) quando ele parar esperando; ela não aparece na tela nem fica no histórico:
+
+```bash
+read -rs TOKEN && printf '{"syncUrl":"https://limits.seudominio.com","syncToken":"%s"}' "$TOKEN" | claude plugin configure limits-left@claude-mod-limits-left --values-stdin; unset TOKEN
+```
+
+`claude plugin configure limits-left@claude-mod-limits-left` sem argumentos mostra o que está configurado. Reinicie as sessões depois de configurar.
 
 ## Limitações conhecidas
 
