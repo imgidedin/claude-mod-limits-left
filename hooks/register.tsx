@@ -426,13 +426,17 @@ type Shown = { kind: string; window: LimitWindow; left: number }
 const gather = async ($: EngineInterface): Promise<{ shown: Shown[]; at: number; held: Spend }> => {
   const held = await read($, windows)
   const at = await read($, now)
+  const spent = await read($, spend)
+  // The reading is a whole point behind the app's own figure once the turns are past half of
+  // the point it is in, so what is left counts them too, rounded as the app rounds what is used.
   const shown = KINDS.flatMap(kind => {
     const window = held[kind]
+    if (window === undefined || window.samples.length === 0) return []
 
-    return window === undefined || window.samples.length === 0 ? [] : [{ kind, window, left: Math.round(left(window)) }]
+    return [{ kind, window, left: Math.max(0, 100 - Math.round(usedOf(window) + (fraction(spent, kind) ?? 0))) }]
   })
 
-  return { shown, at, held: await read($, spend) }
+  return { shown, at, held: spent }
 }
 
 // One window in the footer: its icon, what is left of it, and a mark where it is over pace.
@@ -441,6 +445,16 @@ export const footerLabel = ({ kind, window, left }: Shown, at: number, isTermina
   const mark = isOverPace(kind, window, at, held) ? (isTerminal ? ' ⚠' : ' 🛑') : ''
 
   return `${icon === undefined ? '' : `${isTerminal ? icon.glyph : icon.emoji} `}${left}%${mark}`
+}
+
+// What the store holds now, every session's readings and turns, and the time to read them at.
+const refresh = async ($: EngineInterface): Promise<void> => {
+  const stored = await $.store.get(STORE_KEY)
+  const spent = await $.store.get(SPEND_KEY)
+  const t = await $.clock.now()
+  if (isWindows(stored)) await update($, windows, () => stored)
+  if (isSpend(spent)) await update($, spend, () => spent)
+  await update($, now, () => t)
 }
 
 // The person's own notification where a terminal takes it; a toast where none does, as on the
@@ -512,9 +526,10 @@ export const register: Register = on => {
       name: COMMAND,
       description: 'Mostra ou esconde os cartões de uso das janelas de 5h e 7d acima do prompt',
     })
-    // "The last 15 minutes" moves on while no reading arrives.
+    // "The last 15 minutes" moves on while no reading arrives, and a session that makes no call
+    // of its own takes up the readings the others put in the store.
     $.clock.every(MINUTE, () => {
-      void $.clock.now().then(t => update($, now, () => t))
+      void refresh($)
     })
 
     return started

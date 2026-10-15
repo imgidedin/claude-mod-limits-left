@@ -424,3 +424,43 @@ test('spendTurn keeps a day of turns, those past the hour further apart', () => 
   expect(spend.events.reduce((sum, event) => sum + event.tokens, 0)).toBe(610)
   expect(spendTurn(spend, START + 26 * 60 * MINUTE, usage(1)).events.length).toBe(1)
 })
+
+test('a session that makes no call takes up what another put in the store within a minute', async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  // The store as every session shares it: another one writes to it below.
+  const stored: Record<string, unknown> = { windows: { seven_day: { samples: [{ t: START, used: 71 }] } } }
+  on('store.get', (_, e) => ({ value: stored[e.key] }))
+  on('store.set', (_, e) => {
+    stored[e.key] = e.value
+
+    return { value: undefined }
+  })
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+  on('session.start', (_, e) => e)
+  on('command.register', () => ({ value: undefined }))
+  await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
+
+  const footer = await $.ui.mount({ plugin: 'limits-left', surface: 'desktop', component: 'SessionMode', props: { modes: [] } })
+  expect(await footer.find({ key: 'limits-seven_day' })).toMatchObject({ text: '  📅︎ 29%  ' })
+
+  // Another session reads 73% and writes it to the store.
+  stored.windows = { seven_day: { samples: [{ t: START, used: 71 }, { t: START + 30_000, used: 73 }] } }
+  await clock.advance(MINUTE)
+  await footer.redraw()
+  expect(await footer.find({ key: 'limits-seven_day' })).toMatchObject({ text: '  📅︎ 27%  ' })
+})
+
+test('the footer counts the turns past half of the point the reading is in', async ($, on) => {
+  mock.clock(on, { now: START })
+  // Read at 72, and 600 of a point that takes 1000 gone by since it turned: 72.6, or 73 used.
+  mock.store(on, {
+    windows: { seven_day: { samples: [{ t: START, used: 72 }] } },
+    spend: { total: 1600, events: [], marks: { seven_day: 1000 }, perPoint: { seven_day: 1000 } },
+  })
+  on('session.start', (_, e) => e)
+  on('command.register', () => ({ value: undefined }))
+  await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
+
+  const footer = await $.ui.mount({ plugin: 'limits-left', surface: 'desktop', component: 'SessionMode', props: { modes: [] } })
+  expect(await footer.find({ key: 'limits-seven_day' })).toMatchObject({ text: '  📅︎ 27%  ' })
+})
