@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { NO_SPEND, cardSvg, details, forecast, fraction, isOverPace, mergeWindows, profile, ranges, record, runsOutAt, spendTurn, takePeers, turnPoint, usedIn, workHours } from './register'
+import { NO_SPEND, calibrate, cardSvg, details, forecast, fraction, isOverPace, mergeWindows, profile, ranges, record, runsOutAt, spendTurn, takePeers, turnPoint, usedIn, workHours } from './register'
 
 const MINUTE = 60_000
 const EMPTY = { type: 'Box' } as const
@@ -637,4 +637,19 @@ test('the weekly forecast walks the person\'s week instead of using every hour o
   expect(runsOutAt('seven_day', sooner, at, held)).toBe('never')
   expect(forecast('seven_day', sooner, at, held)).toBe('✓')
   expect(isOverPace('seven_day', sooner, at, held)).toBe(false)
+})
+
+test('the weekly point takes what every machine spent over the points the readings rose', () => {
+  const at = START + 12 * 60 * MINUTE
+  const window = { samples: [{ t: START, used: 60 }, { t: START + 6 * 60 * MINUTE, used: 65 }, { t: at, used: 70 }] }
+  // This machine learned a point as 100 from its own turns; home spent most of them.
+  let held = { ...NO_SPEND, perPoint: { seven_day: 100 } }
+  held = spendTurn(held, START + MINUTE, usage(1000))
+  held = takePeers(held, { home: { own: 0, events: [{ t: START + 2 * MINUTE, tokens: 9000, weight: 9000 }] } }, 'work', at)
+
+  // 10 000 over 10 points.
+  expect(calibrate(held, { seven_day: window }, at).perPoint.seven_day).toBe(1000)
+  // Under six hours of readings, or under four points of rise: left as it was.
+  expect(calibrate(held, { seven_day: { samples: [{ t: at - MINUTE, used: 60 }, { t: at, used: 70 }] } }, at).perPoint.seven_day).toBe(100)
+  expect(calibrate(held, { seven_day: { samples: [{ t: START, used: 68 }, { t: at, used: 70 }] } }, at).perPoint.seven_day).toBe(100)
 })

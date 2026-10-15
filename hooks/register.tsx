@@ -413,6 +413,29 @@ const atLeastSinceMark = (held: Spend, total: number): Record<string, number> =>
     }),
   )
 
+// The weekly window's readings say what a point takes better than any one point does: the
+// weight every machine spent over the last day of readings, over the points they rose. A point
+// seen turning by one machine was spent by all of them, so one machine's own turns alone made
+// it look cheap. Needs six hours and four points of rise; the 5-hour window keeps an hour of
+// readings, too little, and keeps the turns' measure.
+const CALIBRATE_MS = 6 * HOUR
+const CALIBRATE_POINTS = 4
+
+export const calibrate = (held: Spend, windows: Windows, at: number): Spend => {
+  const samples = windows.seven_day?.samples ?? []
+  const first = samples[0]
+  if (first === undefined || at - first.t < CALIBRATE_MS) return held
+  const from = Math.max(first.t, at - DAY)
+  const rose = usedBetween(samples, from, at)
+  if (rose === undefined || rose < CALIBRATE_POINTS) return held
+  const { weight } = spentBetween(held, from, at)
+  if (weight <= 0) return held
+  const perPoint = weight / rose
+  const known = held.perPoint.seven_day
+
+  return known !== undefined && Math.abs(known - perPoint) < known * 0.01 ? held : { ...held, perPoint: { ...held.perPoint, seven_day: perPoint } }
+}
+
 // A window's reading went from one whole number to another: up, the turns since the last
 // time say what a point takes, and the count starts again; down, the window reset.
 export const turnPoint = (held: Spend, kind: string, from: number, to: number): Spend => {
@@ -763,6 +786,7 @@ export const sync = async ($: EngineInterface, remote: SyncOptions, isDue: boole
     const to = merged[kind]?.samples.at(-1)?.used
     if (from !== undefined && to !== undefined && to !== from) counted = turnPoint(counted, kind, from, to)
   }
+  counted = calibrate(counted, merged, t)
 
   await $.store.set(STORE_KEY, merged)
   await $.store.set(SPEND_KEY, counted)
@@ -898,6 +922,7 @@ export const register: Register = (on, options) => {
       const isOlder = before !== undefined && limit.percentUsed < before && limit.percentUsed >= before - 1
       if (before !== undefined && !isOlder) turned = turnPoint(turned, limit.kind, before, limit.percentUsed)
     }
+    if (fresh.length > 0) turned = calibrate(turned, merged, t)
 
     if (fresh.length > 0) {
       await $.store.set(STORE_KEY, merged)
