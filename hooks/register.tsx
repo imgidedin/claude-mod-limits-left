@@ -319,14 +319,17 @@ export const profile = (held: Spend, at: number): Profile | undefined => {
 // When the weekly window runs out, walking hour by hour from now to its reset: the pace of the
 // last hour carries the hour now and fades over the next few, and the person's week does the
 // rest. Undefined where it cannot say: no week learned yet, or no known weight of a point.
-export const runsOutAt = (kind: string, window: LimitWindow, at: number, held: Spend): { at: number } | 'never' | undefined => {
+// How far past the reset the walk goes to say how long what is left would last.
+const LASTS_HORIZON = 28 * DAY
+
+export const runsOutAt = (kind: string, window: LimitWindow, at: number, held: Spend, isPastReset = false): { at: number } | 'never' | undefined => {
   const perPoint = held.perPoint[kind]
   const week = profile(held, at)
   if (perPoint === undefined || week === undefined) return undefined
 
   let leftWeight = Math.max(0, left(window) - (fraction(held, kind) ?? 0)) * perPoint
   const reset = resetsIn(window, at)
-  const until = at + (Number.isNaN(reset) ? 7 * DAY : reset)
+  const until = at + (isPastReset ? LASTS_HORIZON : Number.isNaN(reset) ? 7 * DAY : reset)
   const now = spentIn(held, at, HOUR).weight
   let t = at
   for (let ahead = 0; t < until; ahead++) {
@@ -526,13 +529,18 @@ const resetsIn = (window: LimitWindow, at: number): number =>
   window.resetsAt === undefined ? Number.NaN : Date.parse(window.resetsAt) - at
 
 // What the pace of the last hour does to what is left: fine, or out before the reset.
-export type Outlook = { state: 'collecting' | 'ok' | 'out' } | { state: 'runsOut'; inMs: number }
+// `lastsMs`, where it is known, is how long what is left would last at that pace, past the reset.
+export type Outlook = { state: 'collecting' | 'out' } | { state: 'ok'; lastsMs?: number } | { state: 'runsOut'; inMs: number }
 
 export const outlook = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): Outlook => {
   if (left(window) === 0) return { state: 'out' }
   if (kind === 'seven_day') {
     const out = runsOutAt(kind, window, at, held)
-    if (out === 'never') return { state: 'ok' }
+    if (out === 'never') {
+      const lasts = runsOutAt(kind, window, at, held, true)
+
+      return lasts === undefined || lasts === 'never' ? { state: 'ok' } : { state: 'ok', lastsMs: lasts.at - at }
+    }
     if (out !== undefined) return { state: 'runsOut', inMs: out.at - at }
   }
   const rate = pace(kind, window, at, held)
@@ -542,7 +550,14 @@ export const outlook = (kind: string, window: LimitWindow, at: number, held: Spe
 
   const lastsMs = left(window) / rate
 
-  return lastsMs >= resetsIn(window, at) ? { state: 'ok' } : { state: 'runsOut', inMs: lastsMs }
+  return lastsMs >= resetsIn(window, at) ? { state: 'ok', lastsMs } : { state: 'runsOut', inMs: lastsMs }
+}
+
+// Beside the check: how long what is left would last at this pace; nothing where it is not known.
+export const lasting = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): string => {
+  const o = outlook(kind, window, at, held)
+
+  return o.state === 'ok' && o.lastsMs !== undefined ? `dura ~${duration(o.lastsMs)}` : ''
 }
 
 export const forecast = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): string => {
@@ -603,15 +618,20 @@ const resetLine = (window: LimitWindow, at: number): string => {
 // the tokens (`~0.4% · 182k`). The points are the turns' estimate where a point's weight is
 // known, the readings' otherwise: a dash where the history does not reach, and `<1%` where
 // tokens went and the whole-number reading did not move.
-const spanFigures = (kind: string, window: LimitWindow, at: number, held: Spend, work?: WorkHours): (Range & { figure: string })[] => {
+export type Row = Range & { points: string; tokens?: string; cost?: string; figure: string }
+
+const spanFigures = (kind: string, window: LimitWindow, at: number, held: Spend, work?: WorkHours): Row[] => {
   const hasCost = allSpent(held).some(event => event.usd !== undefined)
 
   return ranges(at, work).map(range => {
     const { tokens, weight, usd } = spentBetween(held, range.from, range.to)
     const perPoint = held.perPoint[kind]
     const used = range.to <= range.from ? 0 : usedBetween(window.samples, range.from, range.to)
-    const points =
-      perPoint !== undefined
+    // The 5-hour window resets inside a working day or a day: no share of it there.
+    const isBeyondWindow = kind === 'five_hour' && !SPANS.some(span => span.label === range.label)
+    const points = isBeyondWindow
+      ? '–'
+      : perPoint !== undefined
         ? `~${round1(weight / perPoint)}%`
         : used === undefined
           ? '–'
@@ -619,10 +639,12 @@ const spanFigures = (kind: string, window: LimitWindow, at: number, held: Spend,
             ? '<1%'
             : `${used}%`
 
-    // The dollars once a ledger has reported any: none at all reads as a host that keeps none.
-    const cost = hasCost ? ` · ${dollars(usd)}` : ''
+    // The tokens once a turn is on record, and the dollars once a ledger has reported any: none
+    // at all reads as a host that keeps none.
+    const counted = held.total === 0 ? undefined : compact(tokens)
+    const cost = hasCost ? dollars(usd) : undefined
 
-    return { ...range, figure: held.total === 0 ? `${points}${cost}` : `${points} · ${compact(tokens)}${cost}` }
+    return { ...range, points, tokens: counted, cost, figure: [points, counted, cost].filter(part => part !== undefined).join(' · ') }
   })
 }
 
@@ -637,57 +659,6 @@ export const details = (kind: string, window: LimitWindow, at: number, held: Spe
     .filter(part => part !== '')
     .join(' · ')
 
-// A figure such as `<1%` is text in the card's markup, not a tag.
-const escapeXml = (text: string): string => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-
-const CARD_W = 300
-const ROWS_Y = 68
-const ROW_H = 20
-// Below the rows: a rule, then the forecast.
-const RULE_Y = ROWS_Y + (SPANS.length + 2) * ROW_H - 10
-const CARD_H = RULE_Y + 32
-const FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif"
-const CARD_CSS = `<style>
-text{font-family:${FONT};font-size:12px;font-variant-numeric:tabular-nums}
-.bg{fill:#fff;stroke:#deddd9}.t{fill:#1f1f1f}.s{fill:#6b6b68}.k{fill:#ecebe8}.ln{stroke:#e8e7e3}
-.bar{fill:#2c7be5}.ok{stroke:#2e9e5b}.bad{fill:#d92d20}
-@media (prefers-color-scheme: dark){.bg{fill:#262624;stroke:#3d3d3a}.t{fill:#ececec}.s{fill:#a8a8a4}.k{fill:#3a3a38}.ln{stroke:#383836}.ok{stroke:#4cc38a}.bad{fill:#f97066}}
-</style>`
-
-// The card a hover shows on a surface that draws pixels: the window as the app's own usage
-// card has it, then what the last 15 minutes, 30 minutes and hour took, and where that leads.
-export const cardSvg = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND, work?: WorkHours): string => {
-  const right = CARD_W - 14
-  const o = outlook(kind, window, at, held)
-  const used = Math.min(100, usedOf(window) + (fraction(held, kind) ?? 0))
-  const rows = spanFigures(kind, window, at, held, work)
-    .map((row, i) => {
-      const y = ROWS_Y + i * ROW_H
-
-      return `<text class="s" x="14" y="${y}">${row.title}</text><text class="t" x="${right}" y="${y}" text-anchor="end">${escapeXml(row.figure)}</text>`
-    })
-    .join('')
-  // Fine is a green check and nothing to read.
-  const verdict =
-    o.state === 'ok'
-      ? `<path class="ok" d="M${right - 12} ${RULE_Y + 13}l4 4 8-9" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`
-      : `<text class="${o.state === 'collecting' ? 's' : 'bad'}" x="${right}" y="${RULE_Y + 18}" text-anchor="end">${forecast(kind, window, at, held)}</text>`
-
-  return [
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${CARD_W}" height="${CARD_H}" viewBox="0 0 ${CARD_W} ${CARD_H}">`,
-    CARD_CSS,
-    `<rect class="bg" x=".5" y=".5" width="${CARD_W - 1}" height="${CARD_H - 1}" rx="10"/>`,
-    `<text class="t" x="14" y="24" font-weight="600">${TITLES[kind] ?? kind}</text>`,
-    `<text x="${right}" y="24" text-anchor="end"><tspan class="s">${resetLine(window, at)}  </tspan><tspan class="t">${usedLabel(kind, window, held)}</tspan></text>`,
-    `<rect class="k" x="14" y="34" width="${CARD_W - 28}" height="4" rx="2"/>`,
-    `<rect class="bar" x="14" y="34" width="${round1(((CARD_W - 28) * used) / 100)}" height="4" rx="2"/>`,
-    rows,
-    `<line class="ln" x1="14" y1="${RULE_Y}" x2="${right}" y2="${RULE_Y}"/>`,
-    `<text class="s" x="14" y="${RULE_Y + 18}">No ritmo atual</text>`,
-    verdict,
-    '</svg>',
-  ].join('')
-}
 
 const isSpend = (value: unknown): value is Spend =>
   typeof value === 'object' &&
@@ -838,50 +809,258 @@ const warn = async ($: EngineInterface, text: string): Promise<void> => {
   if (sent?.isSent !== true) $.ui.toast(text, { timeoutMs: WARNING_MS })
 }
 
-// The cards, one per window, with him beside them while a window is over pace. They keep to
-// the band's right end, over the footer's buttons that put them up.
+// A figure such as `<1%` is text in the table's markup, not a tag.
+const escapeXml = (text: string): string => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+
+const FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif"
+const TABLE_CSS = `<style>
+text{font-family:${FONT};font-size:12px;font-variant-numeric:tabular-nums}
+.bg{fill:#fff;stroke:#deddd9}.t{fill:#1f1f1f}.s{fill:#6b6b68}.k{fill:#ecebe8}.ln{stroke:#e8e7e3}
+.bar{fill:#2c7be5}.ok{stroke:#2e9e5b}.good{fill:#2e9e5b}.bad{fill:#d92d20}
+@media (prefers-color-scheme: dark){.bg{fill:#262624;stroke:#3d3d3a}.t{fill:#ececec}.s{fill:#a8a8a4}.k{fill:#3a3a38}.ln{stroke:#383836}.ok{stroke:#4cc38a}.good{fill:#4cc38a}.bad{fill:#f97066}}
+</style>`
+
+// One window's column of the table.
+export type TableWindow = {
+  title: string
+  used: string
+  lasts: string
+  usedShare: number
+  reset: string
+  points: string[]
+  isOk: boolean
+  isCollecting: boolean
+  forecast: string
+}
+
+// Pixels of the table a pixel surface draws: its margin, the periods' titles, then a column per
+// window and the tokens and dollars, each one's figures flush to its right.
+const EDGE_PX = 14
+const TITLE_PX = 118
+const WINDOW_PX = 112
+const TOKEN_PX = 64
+const COST_PX = 70
+const ROW_PX = 20
+
+// One table, a column per window and, where `shared` has them, the tokens and dollars of each
+// period, which are the account's and so one column for all.
+export const tableSvg = (windows: readonly TableWindow[], titles: readonly string[], shared?: { tokens: string[]; cost?: string[] }): string => {
+  const extra =
+    shared === undefined
+      ? []
+      : [{ head: 'Tokens', width: TOKEN_PX, cells: shared.tokens }, ...(shared.cost === undefined ? [] : [{ head: 'Custo', width: COST_PX, cells: shared.cost }])]
+  const width = EDGE_PX * 2 + TITLE_PX + windows.length * WINDOW_PX + extra.reduce((sum, c) => sum + c.width, 0)
+  const windowRight = (i: number) => EDGE_PX + TITLE_PX + (i + 1) * WINDOW_PX
+  const extraRight = (i: number) => windowRight(windows.length - 1) + extra.slice(0, i + 1).reduce((sum, c) => sum + c.width, 0)
+  // The rule under the resets is each window's bar where it runs under that window's column.
+  const ruleTopY = 58
+  const rowsY = 80
+  const ruleY = rowsY + titles.length * ROW_PX - 8
+  const height = ruleY + 32
+  const text = (cls: string, x: number, y: number, body: string, anchor = 'end', weight = '') =>
+    `<text class="${cls}" x="${x}" y="${y}" text-anchor="${anchor}"${weight === '' ? '' : ` font-weight="${weight}"`}>${escapeXml(body)}</text>`
+
+  const parts = [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
+    TABLE_CSS,
+    `<rect class="bg" x=".5" y=".5" width="${width - 1}" height="${height - 1}" rx="10"/>`,
+    text('s', EDGE_PX, 46, 'Reinicia em', 'start'),
+    `<line class="ln" x1="${EDGE_PX}" y1="${ruleTopY}" x2="${width - EDGE_PX}" y2="${ruleTopY}"/>`,
+    ...titles.map((title, r) => text('s', EDGE_PX, rowsY + r * ROW_PX, title, 'start')),
+    `<line class="ln" x1="${EDGE_PX}" y1="${ruleY}" x2="${width - EDGE_PX}" y2="${ruleY}"/>`,
+    text('s', EDGE_PX, ruleY + 19, 'No ritmo atual', 'start'),
+  ]
+  windows.forEach((w, i) => {
+    const x = windowRight(i)
+    const barWidth = WINDOW_PX - 16
+    parts.push(
+      `<text x="${x}" y="24" text-anchor="end"><tspan class="s">${escapeXml(w.title)}  </tspan><tspan class="t" font-weight="600">${escapeXml(w.used)}</tspan></text>`,
+      text('s', x, 46, w.reset),
+      `<rect class="k" x="${x - barWidth}" y="${ruleTopY - 1.5}" width="${barWidth}" height="3" rx="1.5"/>`,
+      `<rect class="bar" x="${x - barWidth}" y="${ruleTopY - 1.5}" width="${round1((barWidth * Math.min(100, w.usedShare)) / 100)}" height="3" rx="1.5"/>`,
+      ...w.points.map((point, r) => text('t', x, rowsY + r * ROW_PX, point)),
+      ...(w.isOk
+        ? [
+            `<path class="ok" d="M${x - 12} ${ruleY + 14}l4 4 8-9" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`,
+            ...(w.lasts === '' ? [] : [text('good', x - 18, ruleY + 19, w.lasts)]),
+          ]
+        : [text(w.isCollecting ? 's' : 'bad', x, ruleY + 19, w.forecast)]),
+    )
+  })
+  extra.forEach((column, i) => {
+    const x = extraRight(i)
+    parts.push(text('s', x, 46, column.head), ...column.cells.map((cell, r) => text('t', x, rowsY + r * ROW_PX, cell)))
+  })
+  parts.push('</svg>')
+
+  return parts.join('')
+}
+
+// Cells of the table: the periods' titles, then a column per window, then what the turns took.
+const TITLE_CELLS = 17
+const WINDOW_CELLS = 16
+const TOKEN_CELLS = 8
+const COST_CELLS = 9
+const BAR_CELLS = 12
+// What the band keeps beside the table: the Close button and the gaps.
+const BESIDE_CELLS = 12
+
+// What is used of a window as a bar of BAR_CELLS, its filled part and the rest.
+const bar = (used: number): [string, string] => {
+  const filled = Math.max(0, Math.min(BAR_CELLS, Math.round((used / 100) * BAR_CELLS)))
+
+  return ['━'.repeat(filled), '━'.repeat(BAR_CELLS - filled)]
+}
+
+// One table for the windows there is a reading of, the same on every surface: a column per
+// window, and beside them the tokens and dollars of each period, which are the account's and
+// so one column for all. A band too narrow for those two leaves them out; the periods' points
+// stay. Him beside it while a window is over pace.
 const drawCards = async ($: EngineInterface, e: RenderInput, work: WorkHours): Promise<RenderElement | undefined> => {
   const { shown, at, held } = await gather($)
-  if (shown.length === 0) return undefined
+  const first = shown[0]
+  if (first === undefined) return undefined
 
   const ui = $.ui.resolve(e)
   const { Box, Button, Text } = ui
-  // The terminal has no pixels to draw with: bordered boxes for the cards, a triangle for him.
-  const hasPixels = e.surface !== 'terminal' && 'Svg' in ui
+  const columns = (e.props as { bodyColumns?: number }).bodyColumns ?? Number.POSITIVE_INFINITY
+  const windowsWide = TITLE_CELLS + shown.length * WINDOW_CELLS + 4
+  const isWide = windowsWide + TOKEN_CELLS + COST_CELLS + BESIDE_CELLS <= columns
+  const rowsOf = shown.map(({ kind, window }) => spanFigures(kind, window, at, held, work))
+  const shared = rowsOf[0] ?? []
+  const hasTokens = isWide && shared.some(row => row.tokens !== undefined)
+  const hasCost = isWide && shared.some(row => row.cost !== undefined)
   const isAnyOverPace = shown.some(({ kind, window }) => isOverPace(kind, window, at, held))
+  const hasPixels = e.surface !== 'terminal' && 'Svg' in ui
 
-  return (
-    // A band too narrow for both cards in a row takes the second under the first.
-    <Box width="100%" flexWrap="wrap" alignItems="center" justifyContent={hasPixels ? 'flex-end' : 'flex-start'} gap={1}>
-      {!isAnyOverPace ? null : hasPixels ? (
-        <ui.Svg source={PANIC_SVG} alt={PANIC_ALT} width={PANIC_W * 2} height={PANIC_H * 2} />
-      ) : (
-        <Text color="warning">⚠</Text>
+  const line = (key: string, title: string, cells: RenderElement[], extra: RenderElement[] = []) => (
+    <Box key={key}>
+      <Box width={TITLE_CELLS} flexShrink={0}>
+        <Text dimColor wrap="truncate">
+          {title}
+        </Text>
+      </Box>
+      {cells}
+      {extra}
+    </Box>
+  )
+  const cell = (key: string, width: number, child: RenderElement) => (
+    <Box key={key} width={width} flexShrink={0} justifyContent="flex-end">
+      {child}
+    </Box>
+  )
+  const shareCells = (row: Row | undefined, isHeading = false) => [
+    ...(hasTokens ? [cell('tokens', TOKEN_CELLS, <Text tabular dimColor={isHeading}>{isHeading ? 'Tokens' : (row?.tokens ?? '')}</Text>)] : []),
+    ...(hasCost ? [cell('cost', COST_CELLS, <Text tabular dimColor={isHeading}>{isHeading ? 'Custo' : (row?.cost ?? '')}</Text>)] : []),
+  ]
+
+  const table = hasPixels ? (
+    <ui.Svg
+      key="table"
+      source={tableSvg(
+        shown.map(({ kind, window }, w) => {
+          const state = outlook(kind, window, at, held).state
+          const untilReset = resetsIn(window, at)
+
+          return {
+            title: SHORT_TITLES[kind] ?? kind,
+            used: usedLabel(kind, window, held),
+            lasts: lasting(kind, window, at, held),
+            usedShare: usedOf(window) + (fraction(held, kind) ?? 0),
+            reset: untilReset > 0 ? duration(untilReset) : '–',
+            points: (rowsOf[w] ?? []).map(row => row.points),
+            isOk: state === 'ok',
+            isCollecting: state === 'collecting',
+            forecast: forecast(kind, window, at, held),
+          }
+        }),
+        shared.map(row => row.title),
+        hasTokens ? { tokens: shared.map(row => row.tokens ?? ''), ...(hasCost ? { cost: shared.map(row => row.cost ?? '') } : {}) } : undefined,
       )}
-      {shown.map(({ kind, window }) =>
-        hasPixels ? (
-          // No size of its own: the markup's 300 wide, shrunk to fit a narrower band.
-          <ui.Svg key={kind} source={cardSvg(kind, window, at, held, work)} alt={details(kind, window, at, held, work)} />
-        ) : (
-          <Box key={kind} flexDirection="column" width={46} borderStyle="round" paddingX={1}>
-            <Box justifyContent="space-between">
-              <Text bold>{TITLES[kind] ?? kind}</Text>
-              <Text>{usedLabel(kind, window, held)}</Text>
-            </Box>
-            <Text dimColor>{resetLine(window, at)}</Text>
-            {spanFigures(kind, window, at, held, work).map(row => (
-              <Box justifyContent="space-between">
-                <Text dimColor>{row.title}</Text>
-                <Text tabular>{row.figure}</Text>
-              </Box>
-            ))}
-            <Box justifyContent="space-between">
-              <Text dimColor>No ritmo atual</Text>
-              <Text color={outlook(kind, window, at, held).state === 'ok' ? 'success' : 'warning'}>{forecast(kind, window, at, held)}</Text>
-            </Box>
-          </Box>
+      alt={shown.map(({ kind, window }) => details(kind, window, at, held, work)).join('. ')}
+    />
+  ) : (
+    <Box key="table" flexDirection="column" borderStyle="round" paddingX={1}>
+      {line(
+        'heading',
+        '',
+        shown.map(({ kind, window }) =>
+          cell(
+            kind,
+            WINDOW_CELLS,
+            <Text>
+              <Text dimColor>{`${SHORT_TITLES[kind] ?? kind}  `}</Text>
+              <Text bold tabular>
+                {usedLabel(kind, window, held)}
+              </Text>
+            </Text>,
+          ),
         ),
       )}
+      {line(
+        'bar',
+        '',
+        shown.map(({ kind, window }) => {
+          const [filled, rest] = bar(usedOf(window) + (fraction(held, kind) ?? 0))
+
+          return cell(
+            kind,
+            WINDOW_CELLS,
+            <Text>
+              <Text color="suggestion">{filled}</Text>
+              <Text dimColor>{rest}</Text>
+            </Text>,
+          )
+        }),
+      )}
+      {line(
+        'reset',
+        'Reinicia em',
+        shown.map(({ kind, window }) => {
+          const untilReset = resetsIn(window, at)
+
+          return cell(kind, WINDOW_CELLS, <Text dimColor tabular>{untilReset > 0 ? duration(untilReset) : '–'}</Text>)
+        }),
+        shareCells(undefined, true),
+      )}
+      <Box key="gap-1" height={1} />
+      {shared.map((row, i) =>
+        line(
+          `range-${row.label}`,
+          row.title,
+          shown.map(({ kind }, w) => cell(kind, WINDOW_CELLS, <Text tabular>{rowsOf[w]?.[i]?.points ?? ''}</Text>)),
+          shareCells(row),
+        ),
+      )}
+      <Box key="gap-2" height={1} />
+      {line(
+        'pace',
+        'No ritmo atual',
+        shown.map(({ kind, window }) => {
+          const state = outlook(kind, window, at, held).state
+
+          return cell(
+            kind,
+            WINDOW_CELLS,
+            <Text color={state === 'ok' ? 'success' : state === 'collecting' ? undefined : 'error'} dimColor={state === 'collecting'}>
+              {state === 'ok' ? [lasting(kind, window, at, held), '✓'].filter(part => part !== '').join(' ') : forecast(kind, window, at, held)}
+            </Text>,
+          )
+        }),
+      )}
+    </Box>
+  )
+
+  return (
+    <Box width="100%" flexWrap="wrap" alignItems="center" justifyContent="flex-end" gap={1}>
+      {!isAnyOverPace ? null : hasPixels ? (
+        <ui.Svg key="panic" source={PANIC_SVG} alt={PANIC_ALT} width={PANIC_W * 2} height={PANIC_H * 2} />
+      ) : (
+        <Text key="panic" color="warning">
+          ⚠
+        </Text>
+      )}
+      {table}
       <Button key="limits-close" label="Fechar" role="dismiss" onPress={() => update($, isOpen, () => false)} />
     </Box>
   )

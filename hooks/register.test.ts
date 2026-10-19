@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { NO_SPEND, calibrate, cardSvg, details, forecast, fraction, isOverPace, mergeWindows, profile, ranges, record, runsOutAt, spendTurn, takePeers, turnPoint, usedIn, workHours } from './register'
+import { NO_SPEND, calibrate, details, forecast, lasting, fraction, isOverPace, mergeWindows, profile, ranges, record, runsOutAt, spendTurn, takePeers, turnPoint, usedIn, workHours } from './register'
 
 const MINUTE = 60_000
 const EMPTY = { type: 'Box' } as const
@@ -73,20 +73,70 @@ test('forecast projects the pace of the last hour onto what is left', () => {
   )
 })
 
-test('the card says the pace is fine with a check and nothing to read', () => {
+test('the table says the pace is fine with a check and nothing to read', async ($, on) => {
+  const at = START + 60 * MINUTE
+  const table = async (resetMinutes: number) => {
+    const samples = [
+      { t: START, used: 10 },
+      { t: at, used: 40 },
+    ]
+    mock.store(on, { windows: { five_hour: { samples, resetsAt: new Date(at + resetMinutes * MINUTE).toISOString() } } })
+    mock.clock(on, { now: at })
+    on('session.start', (_, e) => e)
+    on('command.register', () => ({ value: undefined }))
+    on('ui.render', () => EMPTY)
+    await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
+    await $.command.run({ command: 'limits', args: '' } as never)
+    const band = await $.ui.mount({ plugin: 'limits-left', surface: 'desktop', component: 'AbovePrompt', props: BAND })
+
+    return JSON.stringify(await band.drawn())
+  }
+
+  const fine = await table(90)
+  expect(fine).toContain('✓')
+  expect(fine).toContain('1h30')
+  expect(fine).not.toContain('esgota')
+})
+
+test('the table says when the window runs out', async ($, on) => {
+  const at = START + 60 * MINUTE
   const samples = [
     { t: START, used: 10 },
-    { t: START + 60 * MINUTE, used: 40 },
+    { t: at, used: 40 },
   ]
-  const at = START + 60 * MINUTE
-  const fine = cardSvg('five_hour', { samples, resetsAt: new Date(at + 90 * MINUTE).toISOString() }, at)
-  const short = cardSvg('five_hour', { samples, resetsAt: new Date(at + 240 * MINUTE).toISOString() }, at)
+  mock.store(on, { windows: { five_hour: { samples, resetsAt: new Date(at + 240 * MINUTE).toISOString() } } })
+  mock.clock(on, { now: at })
+  on('session.start', (_, e) => e)
+  on('command.register', () => ({ value: undefined }))
+  on('ui.render', () => EMPTY)
+  await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
+  await $.command.run({ command: 'limits', args: '' } as never)
+  const band = await $.ui.mount({ plugin: 'limits-left', surface: 'desktop', component: 'AbovePrompt', props: BAND })
 
-  expect(fine).toContain('class="ok"')
-  expect(fine).toContain('Reinicia em 1h30')
-  expect(fine).not.toContain('esgota')
-  expect(short).toContain('esgota em ~2h00')
-  expect(short).not.toContain('class="ok"')
+  expect(JSON.stringify(await band.drawn())).toContain('esgota em ~2h00')
+})
+
+test('a narrow band leaves out the tokens and the dollars and keeps the points', async ($, on) => {
+  const at = START + 60 * MINUTE
+  mock.store(on, {
+    windows: { five_hour: { samples: [{ t: START, used: 10 }, { t: at, used: 40 }] }, seven_day: { samples: [{ t: at, used: 50 }] } },
+    spend: { total: 1000, events: [{ t: at - MINUTE, tokens: 1000, weight: 1000, usd: 0.5 }], marks: {}, perPoint: {} },
+  })
+  mock.clock(on, { now: at })
+  on('session.start', (_, e) => e)
+  on('command.register', () => ({ value: undefined }))
+  on('ui.render', () => EMPTY)
+  await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
+  await $.command.run({ command: 'limits', args: '' } as never)
+
+  const wide = await $.ui.mount({ plugin: 'limits-left', surface: 'desktop', component: 'AbovePrompt', props: BAND })
+  expect(JSON.stringify(await wide.drawn())).toContain('>$0.50<')
+  const narrow = await $.ui.mount({ plugin: 'limits-left', surface: 'desktop', component: 'AbovePrompt', props: { ...BAND, bodyColumns: 60 } })
+  const drawn = JSON.stringify(await narrow.drawn())
+  // Not drawn as columns; the description for a screen reader still says them.
+  expect(drawn).not.toContain('>$0.50<')
+  expect(drawn).not.toContain('>Tokens<')
+  expect(drawn).toContain('>7d  </tspan>')
 })
 
 test('warns when the 5-hour window runs out more than half an hour before it resets', () => {
@@ -175,8 +225,8 @@ for (const surface of ['terminal', 'desktop'] as const) {
       const footer = await $.ui.mount({ plugin: 'limits-left', surface, component: 'SessionMode', props: { modes: [] } })
       await footer.press({ key: 'limits-five_hour' })
       await band.redraw()
-      expect(JSON.stringify(await band.drawn())).toContain('Limite de sess')
-      expect(JSON.stringify(await band.drawn())).toContain('Semanal')
+      expect(JSON.stringify(await band.drawn())).toContain('>5h  </tspan>')
+      expect(JSON.stringify(await band.drawn())).toContain('>7d  </tspan>')
 
       await footer.press({ key: 'limits-seven_day' })
       await band.redraw()
@@ -289,9 +339,6 @@ test('the card shows the estimate and the tokens beside the points', () => {
   expect(details('seven_day', window, at, calibrated)).toBe(
     'Semanal · 7d: ~66.4% usado · 15m ~0.4% · 200k · 30m ~0.4% · 200k · 1h ~0.4% · 200k · 8h–18h ~0.4% · 200k · 24h ~0.4% · 200k · ✓',
   )
-  expect(cardSvg('seven_day', window, at, calibrated)).toContain('~66.4%')
-  // The card is markup: a bare `<` in a figure would leave it undrawn.
-  expect(cardSvg('seven_day', window, at, uncalibrated)).toContain('&lt;1% · 200k')
 })
 
 test('a turn that ends goes on the count the sessions share', async ($, on) => {
@@ -316,7 +363,8 @@ test('a turn that ends goes on the count the sessions share', async ($, on) => {
 
   // A point took the 1000 between 66 and 67; the 300 since are three tenths of the next.
   expect(drawn).toContain('~67.3%')
-  expect(drawn).toContain('~1.3% · 1.3k')
+  expect(drawn).toContain('"~1.3%"')
+  expect(drawn).toContain('"1.3k"')
 })
 
 // The desktop has no terminal to notify through: the warning is a toast there.
@@ -587,7 +635,11 @@ test('what the session cost goes beside the tokens, from the first measurement o
   await $.command.run({ command: 'limits', args: '' } as never)
 
   const band = await $.ui.mount({ plugin: 'limits-left', surface: 'terminal', component: 'AbovePrompt', props: BAND })
-  expect(JSON.stringify(await band.drawn())).toContain('1k · $0.45')
+  const drawn = JSON.stringify(await band.drawn())
+  // Tokens and dollars in their own cells; the $3 the ledger stood at before is not there.
+  expect(drawn).toContain('"1k"')
+  expect(drawn).toContain('"$0.45"')
+  expect(drawn).not.toContain('$3')
 })
 
 // A week of work from 9 to 18 on weekdays, 50 of weight an hour, from Monday 12 October 2026.
@@ -688,4 +740,35 @@ test('the weekly point is weighed over the whole week once every machine counted
   // A machine that spent in the week but began counting inside it: not this measure.
   const late = { ...held, peers: { home: { ...home, since: local(17, 9) } } }
   expect(calibrate(late, { seven_day: window }, local(19, 9)).perPoint.seven_day).toBe(37)
+})
+
+test('the 5-hour window has no share of a working day or a whole day', () => {
+  const at = START + 60 * MINUTE
+  const window = { samples: [{ t: START, used: 10 }, { t: at, used: 40 }] }
+  const held = { ...spendTurn(NO_SPEND, at - MINUTE, usage(1000)), perPoint: { five_hour: 100, seven_day: 1000 } }
+
+  expect(details('five_hour', window, at, held)).toContain('8h–18h – · 1k')
+  expect(details('five_hour', window, at, held)).toContain('24h – · 1k')
+  expect(details('seven_day', window, at, held)).toContain('24h ~1% · 1k')
+})
+
+test('beside the check, how long what is left would last at this pace', () => {
+  // 30 points an hour, 60 left: two hours, with three to the reset.
+  const samples = [
+    { t: START, used: 10 },
+    { t: START + 60 * MINUTE, used: 40 },
+  ]
+  const at = START + 60 * MINUTE
+  const window = { samples, resetsAt: new Date(at + 180 * MINUTE).toISOString() }
+  expect(forecast('five_hour', window, at)).toBe('esgota em ~2h00')
+  expect(lasting('five_hour', window, at)).toBe('')
+
+  const slow = { samples: [{ t: START, used: 10 }, { t: at, used: 20 }], resetsAt: new Date(at + 180 * MINUTE).toISOString() }
+  expect(forecast('five_hour', slow, at)).toBe('✓')
+  expect(lasting('five_hour', slow, at)).toBe('dura ~8h00')
+
+  // The weekly window walks the person's week past the reset to say it: Thursday at 12h49.
+  const week = { samples: [{ t: local(19, 20), used: 90 }], resetsAt: new Date(local(21, 23)).toISOString() }
+  const held = { ...NO_SPEND, hours: workWeek(19, 20), hoursSince: local(11, 23), perPoint: { seven_day: 100 } }
+  expect(lasting('seven_day', week, local(19, 20), held)).toBe('dura ~2d16h')
 })
