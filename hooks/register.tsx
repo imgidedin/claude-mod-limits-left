@@ -272,7 +272,12 @@ const isWeekend = (t: number): boolean => {
   return day === 0 || day === 6
 }
 
-// One machine's averages, an hour of a kind of day it has not seen yet taken from the other kind.
+// How many days of its own a kind of day needs before its average counts as much as the one of
+// every day seen: one heavy Friday must not stand for every weekday to come.
+const PRIOR_DAYS = 3
+
+// One machine's averages: each hour of a kind of day is that kind's average, drawn toward the
+// average of every day seen at that hour while it has few days of its own.
 const machineWeek = (hours: readonly Hourly[], since: number, end: number): Profile => {
   const from = Math.max(hourOf(since) + HOUR, end - PROFILE_DAYS * DAY)
   const byHour = new Map(hours.filter(h => h.t >= from && h.t < end).map(h => [h.t, h.weight]))
@@ -284,14 +289,17 @@ const machineWeek = (hours: readonly Hourly[], since: number, end: number): Prof
     sums[type][hour] = (sums[type][hour] ?? 0) + (byHour.get(t) ?? 0)
     counts[type][hour] = (counts[type][hour] ?? 0) + 1
   }
-  const average = (type: DayType, hour: number): number | undefined => {
-    const count = counts[type][hour] ?? 0
+  const estimate = (type: DayType, other: DayType) =>
+    sums[type].map((sum, hour) => {
+      const count = counts[type][hour] ?? 0
+      const seen = count + (counts[other][hour] ?? 0)
+      if (seen === 0) return 0
+      const pooled = (sum + (sums[other][hour] ?? 0)) / seen
 
-    return count === 0 ? undefined : (sums[type][hour] ?? 0) / count
-  }
-  const filled = (type: DayType, other: DayType) => sums[type].map((_, hour) => average(type, hour) ?? average(other, hour) ?? 0)
+      return (sum + PRIOR_DAYS * pooled) / (count + PRIOR_DAYS)
+    })
 
-  return { weekday: filled('weekday', 'weekend'), weekend: filled('weekend', 'weekday') }
+  return { weekday: estimate('weekday', 'weekend'), weekend: estimate('weekend', 'weekday') }
 }
 
 export const profile = (held: Spend, at: number): Profile | undefined => {
@@ -413,7 +421,7 @@ const atLeastSinceMark = (held: Spend, total: number): Record<string, number> =>
     }),
   )
 
-// The weekly window's readings say what a point takes better than any one point does: the
+// Otherwise the weekly window's readings say what a point takes better than any one point does: the
 // weight every machine spent over the last day of readings, over the points they rose. A point
 // seen turning by one machine was spent by all of them, so one machine's own turns alone made
 // it look cheap. Needs six hours and four points of rise; the 5-hour window keeps an hour of
@@ -421,7 +429,36 @@ const atLeastSinceMark = (held: Spend, total: number): Record<string, number> =>
 const CALIBRATE_MS = 6 * HOUR
 const CALIBRATE_POINTS = 4
 
+// The surest measure: the weight every machine spent hour by hour since the weekly window began,
+// over the points it stands at. Only where every machine that spent in the week was counting
+// its hours from before the week began, and four points into it.
+const weekPerPoint = (held: Spend, window: LimitWindow | undefined): number | undefined => {
+  const used = window?.samples.at(-1)?.used
+  const reset = window?.resetsAt === undefined ? Number.NaN : Date.parse(window.resetsAt)
+  if (used === undefined || used < CALIBRATE_POINTS || Number.isNaN(reset)) return undefined
+  const began = reset - 7 * DAY
+  const machines = [
+    { hours: held.hours ?? [], since: held.hoursSince },
+    ...Object.values(held.peers ?? {}).map(peer => ({ hours: peer.hours ?? [], since: peer.since })),
+  ]
+  let weight = 0
+  for (const machine of machines) {
+    const spent = machine.hours.filter(h => h.t >= hourOf(began))
+    if (spent.length === 0) continue
+    if (machine.since === undefined || machine.since > began) return undefined
+    weight += spent.reduce((sum, h) => sum + h.weight, 0)
+  }
+
+  return weight > 0 ? weight / used : undefined
+}
+
 export const calibrate = (held: Spend, windows: Windows, at: number): Spend => {
+  const week = weekPerPoint(held, windows.seven_day)
+  if (week !== undefined) {
+    const known = held.perPoint.seven_day
+
+    return known !== undefined && Math.abs(known - week) < known * 0.01 ? held : { ...held, perPoint: { ...held.perPoint, seven_day: week } }
+  }
   const samples = windows.seven_day?.samples ?? []
   const first = samples[0]
   if (first === undefined || at - first.t < CALIBRATE_MS) return held
@@ -611,7 +648,7 @@ const RULE_Y = ROWS_Y + (SPANS.length + 2) * ROW_H - 10
 const CARD_H = RULE_Y + 32
 const FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif"
 const CARD_CSS = `<style>
-text{font-family:${FONT};font-size:12px}
+text{font-family:${FONT};font-size:12px;font-variant-numeric:tabular-nums}
 .bg{fill:#fff;stroke:#deddd9}.t{fill:#1f1f1f}.s{fill:#6b6b68}.k{fill:#ecebe8}.ln{stroke:#e8e7e3}
 .bar{fill:#2c7be5}.ok{stroke:#2e9e5b}.bad{fill:#d92d20}
 @media (prefers-color-scheme: dark){.bg{fill:#262624;stroke:#3d3d3a}.t{fill:#ececec}.s{fill:#a8a8a4}.k{fill:#3a3a38}.ln{stroke:#383836}.ok{stroke:#4cc38a}.bad{fill:#f97066}}
@@ -835,7 +872,7 @@ const drawCards = async ($: EngineInterface, e: RenderInput, work: WorkHours): P
             {spanFigures(kind, window, at, held, work).map(row => (
               <Box justifyContent="space-between">
                 <Text dimColor>{row.title}</Text>
-                <Text>{row.figure}</Text>
+                <Text tabular>{row.figure}</Text>
               </Box>
             ))}
             <Box justifyContent="space-between">
@@ -986,7 +1023,7 @@ export const register: Register = (on, options) => {
             >
               {PAD}
               {icon === undefined ? null : <Text dimColor>{`${icon} `}</Text>}
-              {`${item.left}%`}
+              <Text tabular>{`${item.left}%`}</Text>
               {isOverPace(item.kind, item.window, at, held) ? <Text color="error"> 🛑</Text> : null}
               {PAD}
             </Button>

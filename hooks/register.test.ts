@@ -4,6 +4,10 @@ import { NO_SPEND, calibrate, cardSvg, details, forecast, fraction, isOverPace, 
 
 const MINUTE = 60_000
 const EMPTY = { type: 'Box' } as const
+// The engine's empty answer: a Box with nothing in it, whatever marks it carries.
+// To the hundredth, for averages that come out as long fractions.
+const near = (n: number | undefined) => Math.round((n ?? Number.NaN) * 100) / 100
+const isBlank = (tree: { type: string; children?: unknown[] }) => tree.type === 'Box' && (tree.children ?? []).length === 0
 const START = Date.parse('2026-10-08T12:00:00Z')
 const BAND = {
   hasSurvey: false,
@@ -157,7 +161,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     ])
 
     const band = await $.ui.mount({ plugin: 'limits-left', surface, component: 'AbovePrompt', props: BAND })
-    expect(await band.drawn()).toEqual(EMPTY)
+    expect(isBlank(await band.drawn())).toBe(true)
 
     expect(await $.command.run({ command: 'limits', args: '' } as never)).toMatchObject({ text: 'Cartões de uso abertos acima do prompt.' })
     await band.redraw()
@@ -165,7 +169,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
 
     await band.press({ key: 'limits-close' })
     await band.redraw()
-    expect(await band.drawn()).toEqual(EMPTY)
+    expect(isBlank(await band.drawn())).toBe(true)
 
     if (surface === 'desktop') {
       const footer = await $.ui.mount({ plugin: 'limits-left', surface, component: 'SessionMode', props: { modes: [] } })
@@ -176,7 +180,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
 
       await footer.press({ key: 'limits-seven_day' })
       await band.redraw()
-      expect(await band.drawn()).toEqual(EMPTY)
+      expect(isBlank(await band.drawn())).toBe(true)
     }
   })
 }
@@ -205,7 +209,7 @@ test('passes while there is no reading', async ($, on) => {
 
   const footer = await $.ui.mount({ plugin: 'limits-left', surface: 'terminal', component: 'SessionMode', props: { modes: [] } })
 
-  expect(await footer.drawn()).toEqual(EMPTY)
+  expect(isBlank(await footer.drawn())).toBe(true)
 })
 
 const usage = (input: number, output = 0, cacheRead = 0) => ({
@@ -601,9 +605,12 @@ const workWeek = (untilDay: number, untilHour: number) => {
 test('the week is learned hour by hour, the weekend from what it saw of it', () => {
   const held = { ...NO_SPEND, hours: workWeek(19, 20), hoursSince: local(11, 23) }
   const week = profile(held, local(19, 20))
-  expect(week?.weekday[10]).toBe(50)
+  // Six weekdays at 50 and two weekend days at 0 at 10h: every day seen averages 37.5, and the
+  // weekdays, three days' worth of that average short of standing alone, come to 45.8; the
+  // weekend's two idle days are not yet enough to read it as idle.
+  expect(near(week?.weekday[10])).toBe(near(45.83))
+  expect(near(week?.weekend[10])).toBe(near(22.5))
   expect(week?.weekday[20]).toBe(0)
-  expect(week?.weekend[10]).toBe(0)
 
   // Less than a day on record: nothing learned yet.
   expect(profile({ ...NO_SPEND, hours: [], hoursSince: local(19, 8) }, local(19, 20))).toBe(undefined)
@@ -616,7 +623,8 @@ test('a machine that began counting later is not read as idle before it began', 
   const held = { ...NO_SPEND, hours: evenings, hoursSince: local(16, 23), peers: { work } }
 
   const week = profile(held, local(19, 0))
-  expect(week?.weekday[10]).toBe(50)
+  // Work: five weekdays at 50 and two idle weekend days, drawn toward their average.
+  expect(near(week?.weekday[10])).toBe(near(44.64))
   // Home has seen no weekday yet, so its weekend stands for it.
   expect(week?.weekday[20]).toBe(20)
   expect(week?.weekend[21]).toBe(20)
@@ -625,11 +633,12 @@ test('a machine that began counting later is not read as idle before it began', 
 test('the weekly forecast walks the person\'s week instead of using every hour of it', () => {
   const at = local(19, 20)
   const held = { ...NO_SPEND, hours: workWeek(19, 20), hoursSince: local(11, 23), perPoint: { seven_day: 100 } }
-  // 10 points left, a point takes 100: 1000 of weight, 450 a working day.
+  // 10 points left, a point takes 100: 1000 of weight, about 412 a working day as the week is
+  // learned so far, so Tuesday and Wednesday leave 175, three hours and 49 minutes of Thursday.
   const window = { samples: [{ t: at, used: 90 }], resetsAt: new Date(local(24, 20)).toISOString() }
 
-  expect(runsOutAt('seven_day', window, at, held)).toEqual({ at: local(22, 11) })
-  expect(forecast('seven_day', window, at, held)).toBe('esgota em ~2d15h')
+  expect(runsOutAt('seven_day', window, at, held)).toEqual({ at: local(22, 12) + 49 * MINUTE })
+  expect(forecast('seven_day', window, at, held)).toBe('esgota em ~2d16h')
   expect(isOverPace('seven_day', window, at, held)).toBe(true)
 
   // With the reset on Wednesday night it lasts.
@@ -652,4 +661,31 @@ test('the weekly point takes what every machine spent over the points the readin
   // Under six hours of readings, or under four points of rise: left as it was.
   expect(calibrate(held, { seven_day: { samples: [{ t: at - MINUTE, used: 60 }, { t: at, used: 70 }] } }, at).perPoint.seven_day).toBe(100)
   expect(calibrate(held, { seven_day: { samples: [{ t: START, used: 68 }, { t: at, used: 70 }] } }, at).perPoint.seven_day).toBe(100)
+})
+
+test('one heavy day does not stand for every day of its kind', () => {
+  // Counting began on Thursday night; Friday was heavy, 300 an hour from 9 to 18, and the
+  // weekend and Monday morning were idle.
+  const at = local(19, 9)
+  const friday = [9, 10, 11, 12, 13, 14, 15, 16, 17].map(h => ({ t: local(16, h), weight: 300 }))
+  const week = profile({ ...NO_SPEND, hours: friday, hoursSince: local(15, 22) }, at)
+
+  // Every day seen at 10h: one Friday at 300, two weekend days and nothing else, 100; the one
+  // weekday on record draws the weekdays only partway from that toward 300.
+  expect(near(week?.weekday[10])).toBe(near((300 + 3 * 100) / 4))
+})
+
+test('the weekly point is weighed over the whole week once every machine counted it', () => {
+  const reset = local(23, 18)
+  const window = { samples: [{ t: local(19, 9), used: 21 }], resetsAt: new Date(reset).toISOString() }
+  // The week began on Friday 16 at 18h; 2100 spent since, between two machines, and 500 before.
+  const own = [{ t: local(16, 17), weight: 500 }, { t: local(16, 20), weight: 1100 }]
+  const home = { own: 0, events: [], hours: [{ t: local(18, 21), weight: 1000 }], since: local(15, 20) }
+  const held = { ...NO_SPEND, hours: own, hoursSince: local(15, 17), peers: { home }, perPoint: { seven_day: 37 } }
+
+  expect(calibrate(held, { seven_day: window }, local(19, 9)).perPoint.seven_day).toBe(100)
+
+  // A machine that spent in the week but began counting inside it: not this measure.
+  const late = { ...held, peers: { home: { ...home, since: local(17, 9) } } }
+  expect(calibrate(late, { seven_day: window }, local(19, 9)).perPoint.seven_day).toBe(37)
 })
