@@ -15,11 +15,11 @@ acompanha o seu ritmo de consumo e avisa antes de você ficar sem cota.
 
 ## O que ele faz
 
-- **Mostra o que resta, não o que foi gasto.** No rodapé do prompt, ao lado do seletor de modelo, um botão com o que resta da janela de 5 horas e da semanal, nessa ordem: `61%  34%`.
+- **Mostra o que resta, não o que foi gasto.** No rodapé do prompt, ao lado do seletor de modelo, dois botões com o que resta da janela de 5 horas (mais apagado) e da semanal: `61%` `34%`.
 - **Guarda o histórico de consumo.** Uma amostra por minuto de cada janela, compartilhada entre todas as suas sessões e mantida entre reinícios.
 - **Calcula o seu ritmo.** Quanto você usou nos últimos 15 minutos, 30 minutos, na última hora, no seu horário de trabalho de hoje e nas últimas 24 horas, em pontos da janela e em tokens, e se nesse ritmo a cota acaba antes do reset.
 - **Estima a casa decimal.** As leituras chegam em pontos inteiros; o mod conta os tokens dos seus turnos para estimar onde você está dentro do ponto atual (`~66.4%`).
-- **Avisa quando o ritmo está alto demais.** O botão do rodapé muda para o destaque do app (no terminal, o número fica vermelho), e o Claude em pânico aparece junto da tabela. Na leitura em que a janela passa do ritmo, um aviso diz qual foi e em quanto tempo ela esgota: notificação do sistema no terminal, toast no app desktop.
+- **Avisa quando o ritmo está alto demais.** O botão da janela em risco muda para o destaque do app (no terminal, o número fica vermelho), e o Claude em pânico aparece junto da tabela. Na leitura em que a janela passa do ritmo, um aviso diz qual foi e em quanto tempo ela esgota: notificação do sistema no terminal, toast no app desktop.
 
 <div align="center">
 
@@ -68,8 +68,8 @@ Se a variável já existir, acrescente a pasta em vez de substituir. O separador
 
 | Onde | O que aparece |
 | --- | --- |
-| Rodapé do prompt | `61%  34%`: o que resta das janelas de 5 horas e de 7 dias. Em destaque quando alguma passa do ritmo. |
-| Clique no botão | Abre a tabela das duas janelas acima do prompt. Clique de novo para fechar. |
+| Rodapé do prompt | `61%` `34%`: o que resta das janelas de 5 horas e de 7 dias. Em destaque a que passar do ritmo. |
+| Clique em qualquer um dos dois | Abre a tabela das duas janelas acima do prompt. Clique de novo para fechar. |
 | `/limits` | Abre e fecha a mesma tabela pelo teclado. |
 
 No terminal, o rodapé é uma linha de texto (`61% · 34%`, a de 5 horas mais apagada e a que passar do ritmo em vermelho) e a tabela, em texto, abre com `/limits`.

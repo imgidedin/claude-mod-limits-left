@@ -709,9 +709,6 @@ const gather = async ($: EngineInterface): Promise<{ shown: Shown[]; at: number;
   return { shown, at, held: spent }
 }
 
-// What is left of each window, 5-hour first, as the footer writes it: no icons, the order and
-// the shades say which is which.
-export const footerText = (shown: readonly Shown[]): string => shown.map(({ left }) => `${left}%`).join('  ')
 
 // What the store holds now, every session's readings and turns, and the time to read them at.
 const refresh = async ($: EngineInterface): Promise<void> => {
@@ -1171,7 +1168,6 @@ export const register: Register = (on, options) => {
 
     const { Box, Button, Text } = $.ui.resolve(e)
     const modes = e.props.modes.join(' & ')
-    const isAnyOverPace = shown.some(({ kind, window }) => isOverPace(kind, window, at, held))
     // The terminal draws the shades: the 5-hour window muted, the weekly one at full strength,
     // and red where one is over its pace.
     if (e.surface === 'terminal') {
@@ -1190,18 +1186,21 @@ export const register: Register = (on, options) => {
       )
     }
 
-    // The desktop draws a button whole, its text's colors left out: one button, muted, that turns
-    // into the app's accent button while a window is over its pace. A press puts the table up
-    // or takes it down.
+    // The desktop draws a button whole, its text's colors left out, so the shades are the
+    // buttons': the 5-hour one muted, as the effort label is, the weekly one plain, as the
+    // model's name is, and a window over its pace the app's accent button. A press on either
+    // puts the table up or takes it down.
     return (
       <Box alignItems="center" gap={1}>
         {modes === '' ? null : <Text>{modes}</Text>}
-        <Button
-          key="limits-footer"
-          label={`${PAD}${footerText(shown)}${PAD}`}
-          {...(isAnyOverPace ? { variant: 'primary' as const } : { dimColor: true })}
-          onPress={() => update($, isOpen, isShown => !isShown)}
-        />
+        {shown.map(({ kind, window, left }) => (
+          <Button
+            key={`limits-${kind}`}
+            label={`${PAD}${left}%${PAD}`}
+            {...(isOverPace(kind, window, at, held) ? { variant: 'primary' as const } : kind === 'five_hour' ? { dimColor: true } : {})}
+            onPress={() => update($, isOpen, isShown => !isShown)}
+          />
+        ))}
       </Box>
     )
   })

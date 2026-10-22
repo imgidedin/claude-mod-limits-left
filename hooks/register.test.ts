@@ -203,8 +203,12 @@ for (const surface of ['terminal', 'desktop'] as const) {
       expect(drawn).toContain('"children":["91%"]')
       expect(drawn).not.toMatch(/[◷▦⚠🛑]/u)
     } else {
-      // One button for both, the app's accent one while a window is over its pace.
-      expect(await footer.find({ key: 'limits-footer' })).toMatchObject({ type: 'Button', text: '  60%  91%  ', props: { variant: 'primary' } })
+      // A button for each: the 5-hour one over its pace, so the accent one; the weekly one plain.
+      expect(await footer.find({ key: 'limits-five_hour' })).toMatchObject({ type: 'Button', text: '  60%  ', props: { variant: 'primary' } })
+      const weekly = await footer.find({ key: 'limits-seven_day' })
+      expect(weekly).toMatchObject({ type: 'Button', text: '  91%  ' })
+      expect(weekly?.props?.variant).toBe(undefined)
+      expect(weekly?.props?.dimColor).toBe(undefined)
     }
   })
 
@@ -232,12 +236,15 @@ for (const surface of ['terminal', 'desktop'] as const) {
 
     if (surface === 'desktop') {
       const footer = await $.ui.mount({ plugin: 'limits-left', surface, component: 'SessionMode', props: { modes: [] } })
-      await footer.press({ key: 'limits-footer' })
+      // Not over pace: the 5-hour button muted, the weekly one plain.
+      expect(await footer.find({ key: 'limits-five_hour' })).toMatchObject({ props: { dimColor: true } })
+      expect((await footer.find({ key: 'limits-seven_day' }))?.props?.dimColor).toBe(undefined)
+      await footer.press({ key: 'limits-five_hour' })
       await band.redraw()
       expect(JSON.stringify(await band.drawn())).toContain('>5h  </tspan>')
       expect(JSON.stringify(await band.drawn())).toContain('>7d  </tspan>')
 
-      await footer.press({ key: 'limits-footer' })
+      await footer.press({ key: 'limits-seven_day' })
       await band.redraw()
       expect(isBlank(await band.drawn())).toBe(true)
     }
@@ -502,13 +509,13 @@ test('a session that makes no call takes up what another put in the store within
   await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
 
   const footer = await $.ui.mount({ plugin: 'limits-left', surface: 'desktop', component: 'SessionMode', props: { modes: [] } })
-  expect(await footer.find({ key: 'limits-footer' })).toMatchObject({ text: '  29%  ', props: { dimColor: true } })
+  expect(await footer.find({ key: 'limits-seven_day' })).toMatchObject({ text: '  29%  ' })
 
   // Another session reads 73% and writes it to the store.
   stored.windows = { seven_day: { samples: [{ t: START, used: 71 }, { t: START + 30_000, used: 73 }] } }
   await clock.advance(MINUTE)
   await footer.redraw()
-  expect(await footer.find({ key: 'limits-footer' })).toMatchObject({ text: '  27%  ' })
+  expect(await footer.find({ key: 'limits-seven_day' })).toMatchObject({ text: '  27%  ' })
 })
 
 test('the footer counts the turns past half of the point the reading is in', async ($, on) => {
@@ -523,7 +530,7 @@ test('the footer counts the turns past half of the point the reading is in', asy
   await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
 
   const footer = await $.ui.mount({ plugin: 'limits-left', surface: 'desktop', component: 'SessionMode', props: { modes: [] } })
-  expect(await footer.find({ key: 'limits-footer' })).toMatchObject({ text: '  27%  ' })
+  expect(await footer.find({ key: 'limits-seven_day' })).toMatchObject({ text: '  27%  ' })
 })
 
 test('another machine adds what it did since the last sync, and nothing the first time', () => {
@@ -581,7 +588,7 @@ test('syncs with the server named in the options, as one machine', { options: { 
 
   // The work machine's reading of 71 turned a point here; its 9000 so far are not counted.
   const footer = await $.ui.mount({ plugin: 'limits-left', surface: 'desktop', component: 'SessionMode', props: { modes: [] } })
-  expect(await footer.find({ key: 'limits-footer' })).toMatchObject({ text: '  29%  ' })
+  expect(await footer.find({ key: 'limits-seven_day' })).toMatchObject({ text: '  29%  ' })
 
   // Five minutes on, 1000 more there: the next sync counts them, and only one machine sends.
   workOwn = 10_000

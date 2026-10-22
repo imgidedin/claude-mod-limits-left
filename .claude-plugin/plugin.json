@@ -1,6 +1,6 @@
 {
   "name": "limits-left",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "Shows how much of the 5-hour and weekly limits is left in the prompt footer, tracks how fast they are being used, and warns before one runs out.",
   "author": {
     "name": "Gidedin",
