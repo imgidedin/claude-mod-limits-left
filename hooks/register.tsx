@@ -1186,21 +1186,24 @@ export const register: Register = (on, options) => {
       )
     }
 
-    // The desktop draws a button whole, its text's colors left out, so the shades are the
-    // buttons': the 5-hour one muted, as the effort label is, the weekly one plain, as the
-    // model's name is, and a window over its pace the app's accent button. A press on either
-    // puts the table up or takes it down.
+    // The desktop draws a button whole, its text's colors left out, so the figures are text,
+    // shaded as on the terminal, and a small button beside them puts the table up, a `+`, or
+    // takes it down, a `−`.
+    const isShown = await read($, isOpen)
+
     return (
       <Box alignItems="center" gap={1}>
         {modes === '' ? null : <Text>{modes}</Text>}
-        {shown.map(({ kind, window, left }) => (
-          <Button
-            key={`limits-${kind}`}
-            label={`${PAD}${left}%${PAD}`}
-            {...(isOverPace(kind, window, at, held) ? { variant: 'primary' as const } : kind === 'five_hour' ? { dimColor: true } : {})}
-            onPress={() => update($, isOpen, isShown => !isShown)}
-          />
-        ))}
+        {shown.map(({ kind, window, left }) => {
+          const isOver = isOverPace(kind, window, at, held)
+
+          return (
+            <Text key={kind} tabular color={isOver ? 'error' : undefined} dimColor={kind === 'five_hour' && !isOver}>
+              {`${left}%`}
+            </Text>
+          )
+        })}
+        <Button key="limits-open" label={isShown ? '\u00A0−\u00A0' : '\u00A0+\u00A0'} dimColor onPress={() => update($, isOpen, shown => !shown)} />
       </Box>
     )
   })
