@@ -93,7 +93,9 @@ test('the table says the pace is fine with a check and nothing to read', async (
   }
 
   const fine = await table(90)
-  expect(fine).toContain('✓')
+  // The time it would last, in green, and no check.
+  expect(fine).toMatch(/class=\\"good\\"[^>]*>~/)
+  expect(fine).not.toContain('class=\\"bad\\"')
   expect(fine).toContain('1h30')
   expect(fine).not.toContain('esgota')
 })
@@ -113,7 +115,9 @@ test('the table says when the window runs out', async ($, on) => {
   await $.command.run({ command: 'limits', args: '' } as never)
   const band = await $.ui.mount({ plugin: 'limits-left', surface: 'desktop', component: 'AbovePrompt', props: BAND })
 
-  expect(JSON.stringify(await band.drawn())).toContain('esgota em ~2h00')
+  // Only the time, in red.
+  const drawn = JSON.stringify(await band.drawn())
+  expect(drawn).toMatch(/class=\\"bad\\"[^>]*>~2h00</)
 })
 
 test('a narrow band leaves out the tokens and the dollars and keeps the points', async ($, on) => {
@@ -192,10 +196,15 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const footer = await $.ui.mount({ plugin: 'limits-left', surface, component: 'SessionMode', props: { modes: ['focus'] } })
 
     if (surface === 'terminal') {
-      expect(await footer.drawn()).toMatchObject({ type: 'Text', children: ['focus  ◷ 60% ⚠ · ▦ 91%'] })
+      // No icons: the 5-hour window first, red as it is over its pace, the weekly one plain.
+      const drawn = JSON.stringify(await footer.drawn())
+      expect(drawn).toContain('focus  ')
+      expect(drawn).toMatch(/"color":"error"[^}]*\},"children":\["60%"\]/)
+      expect(drawn).toContain('"children":["91%"]')
+      expect(drawn).not.toMatch(/[◷▦⚠🛑]/u)
     } else {
-      expect(await footer.find({ key: 'limits-five_hour' })).toMatchObject({ type: 'Button', text: '  🕐︎ 60% 🛑  ' })
-      expect(await footer.find({ key: 'limits-seven_day' })).toMatchObject({ type: 'Button', text: '  📅︎ 91%  ' })
+      // One button for both, the app's accent one while a window is over its pace.
+      expect(await footer.find({ key: 'limits-footer' })).toMatchObject({ type: 'Button', text: '  60%  91%  ', props: { variant: 'primary' } })
     }
   })
 
@@ -223,12 +232,12 @@ for (const surface of ['terminal', 'desktop'] as const) {
 
     if (surface === 'desktop') {
       const footer = await $.ui.mount({ plugin: 'limits-left', surface, component: 'SessionMode', props: { modes: [] } })
-      await footer.press({ key: 'limits-five_hour' })
+      await footer.press({ key: 'limits-footer' })
       await band.redraw()
       expect(JSON.stringify(await band.drawn())).toContain('>5h  </tspan>')
       expect(JSON.stringify(await band.drawn())).toContain('>7d  </tspan>')
 
-      await footer.press({ key: 'limits-seven_day' })
+      await footer.press({ key: 'limits-footer' })
       await band.redraw()
       expect(isBlank(await band.drawn())).toBe(true)
     }
@@ -248,7 +257,7 @@ test('keeps the history between sessions and the band beneath the cards', async 
   const drawn = JSON.stringify(await ui.drawn())
 
   // 15 points in the hour on record, 75 left: five hours.
-  expect(drawn).toContain('esgota em ~5h00')
+  expect(drawn).toContain('"~5h00"')
   expect(drawn).toContain('another band')
 })
 
@@ -493,13 +502,13 @@ test('a session that makes no call takes up what another put in the store within
   await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
 
   const footer = await $.ui.mount({ plugin: 'limits-left', surface: 'desktop', component: 'SessionMode', props: { modes: [] } })
-  expect(await footer.find({ key: 'limits-seven_day' })).toMatchObject({ text: '  📅︎ 29%  ' })
+  expect(await footer.find({ key: 'limits-footer' })).toMatchObject({ text: '  29%  ', props: { dimColor: true } })
 
   // Another session reads 73% and writes it to the store.
   stored.windows = { seven_day: { samples: [{ t: START, used: 71 }, { t: START + 30_000, used: 73 }] } }
   await clock.advance(MINUTE)
   await footer.redraw()
-  expect(await footer.find({ key: 'limits-seven_day' })).toMatchObject({ text: '  📅︎ 27%  ' })
+  expect(await footer.find({ key: 'limits-footer' })).toMatchObject({ text: '  27%  ' })
 })
 
 test('the footer counts the turns past half of the point the reading is in', async ($, on) => {
@@ -514,7 +523,7 @@ test('the footer counts the turns past half of the point the reading is in', asy
   await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
 
   const footer = await $.ui.mount({ plugin: 'limits-left', surface: 'desktop', component: 'SessionMode', props: { modes: [] } })
-  expect(await footer.find({ key: 'limits-seven_day' })).toMatchObject({ text: '  📅︎ 27%  ' })
+  expect(await footer.find({ key: 'limits-footer' })).toMatchObject({ text: '  27%  ' })
 })
 
 test('another machine adds what it did since the last sync, and nothing the first time', () => {
@@ -572,7 +581,7 @@ test('syncs with the server named in the options, as one machine', { options: { 
 
   // The work machine's reading of 71 turned a point here; its 9000 so far are not counted.
   const footer = await $.ui.mount({ plugin: 'limits-left', surface: 'desktop', component: 'SessionMode', props: { modes: [] } })
-  expect(await footer.find({ key: 'limits-seven_day' })).toMatchObject({ text: '  📅︎ 29%  ' })
+  expect(await footer.find({ key: 'limits-footer' })).toMatchObject({ text: '  29%  ' })
 
   // Five minutes on, 1000 more there: the next sync counts them, and only one machine sends.
   workOwn = 10_000

@@ -15,15 +15,15 @@ acompanha o seu ritmo de consumo e avisa antes de você ficar sem cota.
 
 ## O que ele faz
 
-- **Mostra o que resta, não o que foi gasto.** No rodapé do prompt, ao lado do seletor de modelo: `🕐 61%` para a janela de 5 horas e `📅 34%` para a semanal.
+- **Mostra o que resta, não o que foi gasto.** No rodapé do prompt, ao lado do seletor de modelo, um botão com o que resta da janela de 5 horas e da semanal, nessa ordem: `61%  34%`.
 - **Guarda o histórico de consumo.** Uma amostra por minuto de cada janela, compartilhada entre todas as suas sessões e mantida entre reinícios.
 - **Calcula o seu ritmo.** Quanto você usou nos últimos 15 minutos, 30 minutos, na última hora, no seu horário de trabalho de hoje e nas últimas 24 horas, em pontos da janela e em tokens, e se nesse ritmo a cota acaba antes do reset.
 - **Estima a casa decimal.** As leituras chegam em pontos inteiros; o mod conta os tokens dos seus turnos para estimar onde você está dentro do ponto atual (`~66.4%`).
-- **Avisa quando o ritmo está alto demais.** Um `🛑` aparece ao lado da janela em risco, e o Claude em pânico aparece junto da tabela. Na leitura em que a janela passa do ritmo, um aviso diz qual foi e em quanto tempo ela esgota: notificação do sistema no terminal, toast no app desktop.
+- **Avisa quando o ritmo está alto demais.** O botão do rodapé muda para o destaque do app (no terminal, o número fica vermelho), e o Claude em pânico aparece junto da tabela. Na leitura em que a janela passa do ritmo, um aviso diz qual foi e em quanto tempo ela esgota: notificação do sistema no terminal, toast no app desktop.
 
 <div align="center">
 
-<img src="docs/table.svg" alt="Tabela das duas janelas: 5h com cerca de 40,4% usado e reinício em 51 minutos, 7d com cerca de 66,4% e reinício em 18h51; o consumo de cada período em pontos de cada janela, com os tokens e o custo da conta; no ritmo atual, a 5h dura cerca de 6h55 e a semanal cerca de 3 dias e 4 horas" width="498">
+<img src="docs/table.svg" alt="Tabela das duas janelas: 5h com cerca de 40,4% usado e reinício em 51 minutos, 7d com cerca de 66,4% e reinício em 18h51; o consumo de cada período em pontos de cada janela, com os tokens e o custo da conta; no ritmo atual, em verde, a 5h duraria cerca de 6h55 e a semanal cerca de 3 dias e 4 horas" width="498">
 
 </div>
 
@@ -68,11 +68,11 @@ Se a variável já existir, acrescente a pasta em vez de substituir. O separador
 
 | Onde | O que aparece |
 | --- | --- |
-| Rodapé do prompt | `🕐 61%` e `📅 34%`: o que resta das janelas de 5 horas e de 7 dias. |
-| Clique em qualquer um dos dois | Abre a tabela das duas janelas acima do prompt. Clique de novo para fechar. |
+| Rodapé do prompt | `61%  34%`: o que resta das janelas de 5 horas e de 7 dias. Em destaque quando alguma passa do ritmo. |
+| Clique no botão | Abre a tabela das duas janelas acima do prompt. Clique de novo para fechar. |
 | `/limits` | Abre e fecha a mesma tabela pelo teclado. |
 
-No terminal, o rodapé é uma linha de texto (`◷ 61% · ▦ 34%`) e a tabela, em texto, abre com `/limits`.
+No terminal, o rodapé é uma linha de texto (`61% · 34%`, a de 5 horas mais apagada e a que passar do ritmo em vermelho) e a tabela, em texto, abre com `/limits`.
 
 ### O que a tabela mostra
 
@@ -81,7 +81,7 @@ No terminal, o rodapé é uma linha de texto (`◷ 61% · ▦ 34%`) e a tabela, 
 - **Custo:** quanto as chamadas daquele período custariam pela tabela de preços da API, o mesmo valor que o `/cost` e a status line somam. Numa assinatura (Pro, Max) não é o que você paga, mas dá a medida do quanto usou. Conta a partir do momento em que o mod começa a acompanhar cada sessão.
 - **No ritmo atual (semanal):** a previsão aprende o seu padrão de uso. O mod guarda quanto você gasta em cada hora das últimas 4 semanas, separa dias úteis e fim de semana e, a partir de 1 dia de histórico, simula hora a hora até o reset: o ritmo da última hora pesa nas próximas horas e o seu padrão no resto. Assim noites e fins de semana parados não viram consumo. Com o servidor de sincronização, as horas de todas as máquinas entram no mesmo perfil. Antes de 1 dia de histórico, vale o ritmo simples.
 - **Hoje, 8h–18h e últimas 24 horas:** só na semanal (a de 5 horas reinicia no meio desses períodos e mostra `–`), o mesmo para o seu horário de trabalho de hoje (até agora, ou o de ontem antes de ele começar) e para o último dia. O horário é a opção `workHours`, `8-18` por padrão; escreva `9-17` ou `08:30-17:45` para mudar, com `claude plugin configure limits-left@claude-mod-limits-left`.
-- **No ritmo atual:** um ✓ verde com quanto o que resta duraria nesse ritmo (`dura ~3d4h`) se a cota aguenta até o reset, ou `esgota em ~2h00` em vermelho se não aguenta.
+- **No ritmo atual:** quanto o que resta duraria nesse ritmo: em verde se aguenta até o reset, em vermelho se acaba antes.
 
 ### Quando o aviso aparece
 
@@ -89,14 +89,6 @@ No terminal, o rodapé é uma linha de texto (`◷ 61% · ▦ 34%`) e a tabela, 
 | --- | --- |
 | 5 horas | No ritmo atual, a cota acaba **mais de 30 minutos antes** do reset. |
 | 7 dias | No seu padrão de uso aprendido, a cota acaba antes do reset. Antes de 1 dia de histórico por hora: o ritmo atual passa de **15 pontos por dia** *e* a cota acaba antes do reset. |
-
-<div align="center">
-
-<img src="docs/over-pace.svg" alt="Janela de 5 horas acima do ritmo: o Claude em pânico ao lado dos cartões, o cartão de 5 horas com o consumo em pontos e em tokens, dizendo que a cota esgota em cerca de 51 minutos, e no rodapé um sinal de pare ao lado dos 22% que restam" width="770">
-
-<sub>A janela de 5 horas acima do ritmo: o 🛑 no rodapé, o Claude em pânico ao lado dos cartões e a estimativa em vermelho.</sub>
-
-</div>
 
 ## Como funciona
 

@@ -553,6 +553,19 @@ export const outlook = (kind: string, window: LimitWindow, at: number, held: Spe
   return lastsMs >= resetsIn(window, at) ? { state: 'ok', lastsMs } : { state: 'runsOut', inMs: lastsMs }
 }
 
+// The table's pace: how long what is left lasts at this pace, green where it outlasts the
+// reset and red where it does not; a dash, dim, while there is too little to say.
+export type Pace = { text: string; tone: 'good' | 'bad' | 'dim' }
+
+export const paceFigure = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): Pace => {
+  const o = outlook(kind, window, at, held)
+  if (o.state === 'collecting') return { text: '–', tone: 'dim' }
+  if (o.state === 'out') return { text: 'esgotado', tone: 'bad' }
+  if (o.state === 'runsOut') return { text: `~${duration(o.inMs)}`, tone: 'bad' }
+
+  return { text: o.lastsMs === undefined ? '–' : `~${duration(o.lastsMs)}`, tone: 'good' }
+}
+
 // Beside the check: how long what is left would last at this pace; nothing where it is not known.
 export const lasting = (kind: string, window: LimitWindow, at: number, held: Spend = NO_SPEND): string => {
   const o = outlook(kind, window, at, held)
@@ -677,14 +690,6 @@ const isWindows = (value: unknown): value is Windows =>
 const isDrawn = (element: RenderElement): boolean =>
   element.type === 'Box' && element.children !== undefined && element.children.length > 0
 
-// A clock for the 5-hour window and a calendar for the weekly one. The footer draws text
-// alone, so they are characters: on the desktop the emoji's outline form, which the text
-// selector after it asks for, and plain glyphs on the terminal.
-const ICONS: Record<string, { emoji: string; glyph: string }> = {
-  five_hour: { emoji: '🕐︎', glyph: '◷' },
-  seven_day: { emoji: '📅︎', glyph: '▦' },
-}
-
 type Shown = { kind: string; window: LimitWindow; left: number }
 
 // The windows there is a reading of, in KINDS' order, and the time they are read at.
@@ -704,13 +709,9 @@ const gather = async ($: EngineInterface): Promise<{ shown: Shown[]; at: number;
   return { shown, at, held: spent }
 }
 
-// One window in the footer: its icon, what is left of it, and a mark where it is over pace.
-export const footerLabel = ({ kind, window, left }: Shown, at: number, isTerminal: boolean, held: Spend = NO_SPEND): string => {
-  const icon = ICONS[kind]
-  const mark = isOverPace(kind, window, at, held) ? (isTerminal ? ' ⚠' : ' 🛑') : ''
-
-  return `${icon === undefined ? '' : `${isTerminal ? icon.glyph : icon.emoji} `}${left}%${mark}`
-}
+// What is left of each window, 5-hour first, as the footer writes it: no icons, the order and
+// the shades say which is which.
+export const footerText = (shown: readonly Shown[]): string => shown.map(({ left }) => `${left}%`).join('  ')
 
 // What the store holds now, every session's readings and turns, and the time to read them at.
 const refresh = async ($: EngineInterface): Promise<void> => {
@@ -816,21 +817,18 @@ const FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif"
 const TABLE_CSS = `<style>
 text{font-family:${FONT};font-size:12px;font-variant-numeric:tabular-nums}
 .bg{fill:#fff;stroke:#deddd9}.t{fill:#1f1f1f}.s{fill:#6b6b68}.k{fill:#ecebe8}.ln{stroke:#e8e7e3}
-.bar{fill:#2c7be5}.ok{stroke:#2e9e5b}.good{fill:#2e9e5b}.bad{fill:#d92d20}
-@media (prefers-color-scheme: dark){.bg{fill:#262624;stroke:#3d3d3a}.t{fill:#ececec}.s{fill:#a8a8a4}.k{fill:#3a3a38}.ln{stroke:#383836}.ok{stroke:#4cc38a}.good{fill:#4cc38a}.bad{fill:#f97066}}
+.bar{fill:#2c7be5}.good{fill:#2e9e5b}.bad{fill:#d92d20}
+@media (prefers-color-scheme: dark){.bg{fill:#262624;stroke:#3d3d3a}.t{fill:#ececec}.s{fill:#a8a8a4}.k{fill:#3a3a38}.ln{stroke:#383836}.good{fill:#4cc38a}.bad{fill:#f97066}}
 </style>`
 
 // One window's column of the table.
 export type TableWindow = {
   title: string
   used: string
-  lasts: string
   usedShare: number
   reset: string
   points: string[]
-  isOk: boolean
-  isCollecting: boolean
-  forecast: string
+  pace: Pace
 }
 
 // Pixels of the table a pixel surface draws: its margin, the periods' titles, then a column per
@@ -879,12 +877,7 @@ export const tableSvg = (windows: readonly TableWindow[], titles: readonly strin
       `<rect class="k" x="${x - barWidth}" y="${ruleTopY - 1.5}" width="${barWidth}" height="3" rx="1.5"/>`,
       `<rect class="bar" x="${x - barWidth}" y="${ruleTopY - 1.5}" width="${round1((barWidth * Math.min(100, w.usedShare)) / 100)}" height="3" rx="1.5"/>`,
       ...w.points.map((point, r) => text('t', x, rowsY + r * ROW_PX, point)),
-      ...(w.isOk
-        ? [
-            `<path class="ok" d="M${x - 12} ${ruleY + 14}l4 4 8-9" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`,
-            ...(w.lasts === '' ? [] : [text('good', x - 18, ruleY + 19, w.lasts)]),
-          ]
-        : [text(w.isCollecting ? 's' : 'bad', x, ruleY + 19, w.forecast)]),
+      text(w.pace.tone === 'dim' ? 's' : w.pace.tone, x, ruleY + 19, w.pace.text),
     )
   })
   extra.forEach((column, i) => {
@@ -959,19 +952,15 @@ const drawCards = async ($: EngineInterface, e: RenderInput, work: WorkHours): P
       key="table"
       source={tableSvg(
         shown.map(({ kind, window }, w) => {
-          const state = outlook(kind, window, at, held).state
           const untilReset = resetsIn(window, at)
 
           return {
             title: SHORT_TITLES[kind] ?? kind,
             used: usedLabel(kind, window, held),
-            lasts: lasting(kind, window, at, held),
             usedShare: usedOf(window) + (fraction(held, kind) ?? 0),
             reset: untilReset > 0 ? duration(untilReset) : '–',
             points: (rowsOf[w] ?? []).map(row => row.points),
-            isOk: state === 'ok',
-            isCollecting: state === 'collecting',
-            forecast: forecast(kind, window, at, held),
+            pace: paceFigure(kind, window, at, held),
           }
         }),
         shared.map(row => row.title),
@@ -1037,13 +1026,13 @@ const drawCards = async ($: EngineInterface, e: RenderInput, work: WorkHours): P
         'pace',
         'No ritmo atual',
         shown.map(({ kind, window }) => {
-          const state = outlook(kind, window, at, held).state
+          const pace = paceFigure(kind, window, at, held)
 
           return cell(
             kind,
             WINDOW_CELLS,
-            <Text color={state === 'ok' ? 'success' : state === 'collecting' ? undefined : 'error'} dimColor={state === 'collecting'}>
-              {state === 'ok' ? [lasting(kind, window, at, held), '✓'].filter(part => part !== '').join(' ') : forecast(kind, window, at, held)}
+            <Text tabular color={pace.tone === 'good' ? 'success' : pace.tone === 'bad' ? 'error' : undefined} dimColor={pace.tone === 'dim'}>
+              {pace.text}
             </Text>,
           )
         }),
@@ -1182,32 +1171,37 @@ export const register: Register = (on, options) => {
 
     const { Box, Button, Text } = $.ui.resolve(e)
     const modes = e.props.modes.join(' & ')
+    const isAnyOverPace = shown.some(({ kind, window }) => isOverPace(kind, window, at, held))
+    // The terminal draws the shades: the 5-hour window muted, the weekly one at full strength,
+    // and red where one is over its pace.
     if (e.surface === 'terminal') {
-      const line = shown.map(window => footerLabel(window, at, true, held)).join(' · ')
-
-      return <Text dimColor>{modes === '' ? line : `${modes}  ${line}`}</Text>
+      return (
+        <Text>
+          {modes === '' ? null : <Text dimColor>{`${modes}  `}</Text>}
+          {shown.map(({ kind, window, left }, i) => (
+            <Text key={kind}>
+              {i === 0 ? null : <Text dimColor>{' · '}</Text>}
+              <Text tabular color={isOverPace(kind, window, at, held) ? 'error' : undefined} dimColor={kind === 'five_hour' && !isOverPace(kind, window, at, held)}>
+                {`${left}%`}
+              </Text>
+            </Text>
+          ))}
+        </Text>
+      )
     }
 
+    // The desktop draws a button whole, its text's colors left out: one button, muted, that turns
+    // into the app's accent button while a window is over its pace. A press puts the table up
+    // or takes it down.
     return (
       <Box alignItems="center" gap={1}>
         {modes === '' ? null : <Text>{modes}</Text>}
-        {shown.map(item => {
-          const icon = ICONS[item.kind]?.emoji
-
-          return (
-            <Button
-              key={`limits-${item.kind}`}
-              label={footerLabel(item, at, false, held)}
-              onPress={() => update($, isOpen, shown => !shown)}
-            >
-              {PAD}
-              {icon === undefined ? null : <Text dimColor>{`${icon} `}</Text>}
-              <Text tabular>{`${item.left}%`}</Text>
-              {isOverPace(item.kind, item.window, at, held) ? <Text color="error"> 🛑</Text> : null}
-              {PAD}
-            </Button>
-          )
-        })}
+        <Button
+          key="limits-footer"
+          label={`${PAD}${footerText(shown)}${PAD}`}
+          {...(isAnyOverPace ? { variant: 'primary' as const } : { dimColor: true })}
+          onPress={() => update($, isOpen, isShown => !isShown)}
+        />
       </Box>
     )
   })
