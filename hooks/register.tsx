@@ -233,7 +233,9 @@ export const spendTurn = (held: Spend, t: number, usage: ModelUsage): Spend => {
     usage.cache_read_input_tokens * CACHE_READ_WEIGHT
   const events = addSpent(held.events, { t, tokens, weight })
   const total = held.total + weight
-  const hours = addHourly(held.hours ?? [], t, weight)
+  const weekPoint = held.perPoint.seven_day
+  const hours = addHourly(held.hours ?? [], t, weight, weekPoint)
+  const pointsSince = held.pointsSince ?? (weekPoint === undefined ? undefined : t)
 
   return {
     ...held,
@@ -243,6 +245,7 @@ export const spendTurn = (held: Spend, t: number, usage: ModelUsage): Spend => {
     events,
     hours,
     hoursSince: held.hoursSince ?? t,
+    ...(pointsSince === undefined ? {} : { pointsSince }),
     perPoint: atLeastSinceMark(held, total),
   }
 }
@@ -251,18 +254,25 @@ export const spendTurn = (held: Spend, t: number, usage: ModelUsage): Spend => {
 const PROFILE_DAYS = 28
 const hourOf = (t: number): number => Math.floor(t / HOUR) * HOUR
 
-const addHourly = (hours: readonly Hourly[], t: number, weight: number): Hourly[] => {
+// The turn's points go on its hour by the weight a weekly point takes now; before any is known
+// the hour carries weight alone, and the forecast does not learn from it.
+const addHourly = (hours: readonly Hourly[], t: number, weight: number, perPoint?: number): Hourly[] => {
   const hour = hourOf(t)
   const kept = hours.filter(h => h.t > t - PROFILE_DAYS * DAY)
   const last = kept.at(-1)
+  const points = perPoint === undefined || perPoint <= 0 ? undefined : weight / perPoint
+  const into = last !== undefined && last.t === hour ? last : undefined
+  const sum = into?.points === undefined ? points : points === undefined ? into.points : into.points + points
+  const entry: Hourly = { t: hour, weight: (into?.weight ?? 0) + weight, ...(sum === undefined ? {} : { points: sum }) }
 
-  return last !== undefined && last.t === hour ? [...kept.slice(0, -1), { t: hour, weight: last.weight + weight }] : [...kept, { t: hour, weight }]
+  return into === undefined ? [...kept, entry] : [...kept.slice(0, -1), entry]
 }
 
 // The person's week as their hours taught it: for each hour of a weekday and of a weekend day,
-// in local time, the weight they spend in it on average. Each machine is averaged over the hours
-// since it began counting them, an hour with nothing on record being an hour not used, and the
-// machines add up. Undefined before any machine has a whole day on record.
+// in local time, the points of the weekly window they spend in it on average. Each machine is
+// averaged over the hours since it began counting their points, an hour with nothing on record
+// being an hour not used, and the machines add up. Undefined before any machine has a whole day
+// on record.
 export type Profile = { weekday: number[]; weekend: number[] }
 type DayType = keyof Profile
 
@@ -280,7 +290,7 @@ const PRIOR_DAYS = 3
 // average of every day seen at that hour while it has few days of its own.
 const machineWeek = (hours: readonly Hourly[], since: number, end: number): Profile => {
   const from = Math.max(hourOf(since) + HOUR, end - PROFILE_DAYS * DAY)
-  const byHour = new Map(hours.filter(h => h.t >= from && h.t < end).map(h => [h.t, h.weight]))
+  const byHour = new Map(hours.filter(h => h.t >= from && h.t < end).map(h => [h.t, h.points ?? 0]))
   const sums: Record<DayType, number[]> = { weekday: new Array(24).fill(0), weekend: new Array(24).fill(0) }
   const counts: Record<DayType, number[]> = { weekday: new Array(24).fill(0), weekend: new Array(24).fill(0) }
   for (let t = from; t < end; t += HOUR) {
@@ -305,8 +315,8 @@ const machineWeek = (hours: readonly Hourly[], since: number, end: number): Prof
 export const profile = (held: Spend, at: number): Profile | undefined => {
   const end = hourOf(at)
   const machines = [
-    { hours: held.hours ?? [], since: held.hoursSince },
-    ...Object.values(held.peers ?? {}).map(peer => ({ hours: peer.hours ?? [], since: peer.since })),
+    { hours: held.hours ?? [], since: held.pointsSince },
+    ...Object.values(held.peers ?? {}).map(peer => ({ hours: peer.hours ?? [], since: peer.pointsSince })),
   ].filter((m): m is { hours: Hourly[]; since: number } => m.since !== undefined)
   if (!machines.some(m => end - (hourOf(m.since) + HOUR) >= DAY)) return undefined
 
@@ -327,10 +337,11 @@ export const runsOutAt = (kind: string, window: LimitWindow, at: number, held: S
   const week = profile(held, at)
   if (perPoint === undefined || week === undefined) return undefined
 
-  let leftWeight = Math.max(0, left(window) - (fraction(held, kind) ?? 0)) * perPoint
+  // In points: the week learned is, and the last hour is read by the point's weight now.
+  let leftPoints = Math.max(0, left(window) - (fraction(held, kind) ?? 0))
   const reset = resetsIn(window, at)
   const until = at + (isPastReset ? LASTS_HORIZON : Number.isNaN(reset) ? 7 * DAY : reset)
-  const now = spentIn(held, at, HOUR).weight
+  const now = spentIn(held, at, HOUR).weight / perPoint
   let t = at
   for (let ahead = 0; t < until; ahead++) {
     const next = Math.min(until, hourOf(t) + HOUR)
@@ -340,8 +351,8 @@ export const runsOutAt = (kind: string, window: LimitWindow, at: number, held: S
     const perHour = carried * now + (1 - carried) * usual
     const spent = (perHour * (next - t)) / HOUR
     // To the minute: the fading pace leaves fractions of a millisecond nobody reads.
-    if (spent >= leftWeight) return { at: Math.round((t + (perHour === 0 ? 0 : (leftWeight / perHour) * HOUR)) / MINUTE) * MINUTE }
-    leftWeight -= spent
+    if (spent >= leftPoints) return { at: Math.round((t + (perHour === 0 ? 0 : (leftPoints / perHour) * HOUR)) / MINUTE) * MINUTE }
+    leftPoints -= spent
     t = next
   }
 
@@ -389,6 +400,7 @@ export const takePeers = (held: Spend, devices: Readonly<Record<string, Peer>>, 
       events: peer.events.filter(event => event.t > at - DAY),
       hours: (peer.hours ?? []).filter(h => h.t > at - PROFILE_DAYS * DAY),
       ...(peer.since === undefined ? {} : { since: peer.since }),
+      ...(peer.pointsSince === undefined ? {} : { pointsSince: peer.pointsSince }),
     }
   }
 
@@ -455,12 +467,25 @@ const weekPerPoint = (held: Spend, window: LimitWindow | undefined): number | un
   return weight > 0 ? weight / used : undefined
 }
 
+// The hours of this machine since the weekly window began, their points read again by what a
+// point took over the week; from then on every hour carries points, idle ones being none.
+const reweigh = (held: Spend, window: LimitWindow | undefined, perPoint: number): Spend => {
+  const reset = window?.resetsAt === undefined ? Number.NaN : Date.parse(window.resetsAt)
+  if (Number.isNaN(reset)) return held
+  const began = hourOf(reset - 7 * DAY)
+  const hours = (held.hours ?? []).map(h => (h.t >= began ? { ...h, points: h.weight / perPoint } : h))
+  const pointsSince = held.pointsSince === undefined ? began - HOUR : Math.min(held.pointsSince, began - HOUR)
+
+  return { ...held, hours, pointsSince }
+}
+
 export const calibrate = (held: Spend, windows: Windows, at: number): Spend => {
   const week = weekPerPoint(held, windows.seven_day)
   if (week !== undefined) {
     const known = held.perPoint.seven_day
+    const weighed = reweigh(held, windows.seven_day, week)
 
-    return known !== undefined && Math.abs(known - week) < known * 0.01 ? held : { ...held, perPoint: { ...held.perPoint, seven_day: week } }
+    return known !== undefined && Math.abs(known - week) < known * 0.01 ? weighed : { ...weighed, perPoint: { ...held.perPoint, seven_day: week } }
   }
   const samples = windows.seven_day?.samples ?? []
   const first = samples[0]
@@ -769,6 +794,7 @@ export const sync = async ($: EngineInterface, remote: SyncOptions, isDue: boole
     windows: isWindows(sentWindows) ? sentWindows : {},
     hours: mine.hours ?? [],
     ...(mine.hoursSince === undefined ? {} : { since: mine.hoursSince }),
+    ...(mine.pointsSince === undefined ? {} : { pointsSince: mine.pointsSince }),
   }
   const response = await $.http.fetch(`${remote.url}/v1/sync`, {
     method: 'POST',

@@ -662,20 +662,21 @@ test('what the session cost goes beside the tokens, from the first measurement o
   expect(drawn).not.toContain('$3')
 })
 
-// A week of work from 9 to 18 on weekdays, 50 of weight an hour, from Monday 12 October 2026.
+// A week of work from 9 to 18 on weekdays, 50 of weight an hour (and points of the weekly
+// window each), from Monday 12 October 2026.
 const local = (day: number, hour: number) => new Date(2026, 9, day, hour).getTime()
-const workWeek = (untilDay: number, untilHour: number) => {
-  const hours: { t: number; weight: number }[] = []
+const workWeek = (untilDay: number, untilHour: number, points = 50) => {
+  const hours: { t: number; weight: number; points: number }[] = []
   for (let t = local(12, 0); t < local(untilDay, untilHour); t += 60 * MINUTE) {
     const d = new Date(t)
-    if (d.getDay() >= 1 && d.getDay() <= 5 && d.getHours() >= 9 && d.getHours() < 18) hours.push({ t, weight: 50 })
+    if (d.getDay() >= 1 && d.getDay() <= 5 && d.getHours() >= 9 && d.getHours() < 18) hours.push({ t, weight: 50, points })
   }
 
   return hours
 }
 
 test('the week is learned hour by hour, the weekend from what it saw of it', () => {
-  const held = { ...NO_SPEND, hours: workWeek(19, 20), hoursSince: local(11, 23) }
+  const held = { ...NO_SPEND, hours: workWeek(19, 20), pointsSince: local(11, 23) }
   const week = profile(held, local(19, 20))
   // Six weekdays at 50 and two weekend days at 0 at 10h: every day seen averages 37.5, and the
   // weekdays, three days' worth of that average short of standing alone, come to 45.8; the
@@ -685,14 +686,14 @@ test('the week is learned hour by hour, the weekend from what it saw of it', () 
   expect(week?.weekday[20]).toBe(0)
 
   // Less than a day on record: nothing learned yet.
-  expect(profile({ ...NO_SPEND, hours: [], hoursSince: local(19, 8) }, local(19, 20))).toBe(undefined)
+  expect(profile({ ...NO_SPEND, hours: [], pointsSince: local(19, 8) }, local(19, 20))).toBe(undefined)
 })
 
 test('a machine that began counting later is not read as idle before it began', () => {
-  const work = { own: 0, events: [], hours: workWeek(19, 20), since: local(11, 23) }
+  const work = { own: 0, events: [], hours: workWeek(19, 20), since: local(11, 23), pointsSince: local(11, 23) }
   // Home began on Saturday and spends 20 an hour from 20 to 22, weekend or not.
-  const evenings = [local(17, 20), local(17, 21), local(18, 20), local(18, 21)].map(t => ({ t, weight: 20 }))
-  const held = { ...NO_SPEND, hours: evenings, hoursSince: local(16, 23), peers: { work } }
+  const evenings = [local(17, 20), local(17, 21), local(18, 20), local(18, 21)].map(t => ({ t, weight: 20, points: 20 }))
+  const held = { ...NO_SPEND, hours: evenings, pointsSince: local(16, 23), peers: { work } }
 
   const week = profile(held, local(19, 0))
   // Work: five weekdays at 50 and two idle weekend days, drawn toward their average.
@@ -704,7 +705,7 @@ test('a machine that began counting later is not read as idle before it began', 
 
 test('the weekly forecast walks the person\'s week instead of using every hour of it', () => {
   const at = local(19, 20)
-  const held = { ...NO_SPEND, hours: workWeek(19, 20), hoursSince: local(11, 23), perPoint: { seven_day: 100 } }
+  const held = { ...NO_SPEND, hours: workWeek(19, 20, 0.5), pointsSince: local(11, 23), perPoint: { seven_day: 100 } }
   // 10 points left, a point takes 100: 1000 of weight, about 412 a working day as the week is
   // learned so far, so Tuesday and Wednesday leave 175, three hours and 49 minutes of Thursday.
   const window = { samples: [{ t: at, used: 90 }], resetsAt: new Date(local(24, 20)).toISOString() }
@@ -739,8 +740,8 @@ test('one heavy day does not stand for every day of its kind', () => {
   // Counting began on Thursday night; Friday was heavy, 300 an hour from 9 to 18, and the
   // weekend and Monday morning were idle.
   const at = local(19, 9)
-  const friday = [9, 10, 11, 12, 13, 14, 15, 16, 17].map(h => ({ t: local(16, h), weight: 300 }))
-  const week = profile({ ...NO_SPEND, hours: friday, hoursSince: local(15, 22) }, at)
+  const friday = [9, 10, 11, 12, 13, 14, 15, 16, 17].map(h => ({ t: local(16, h), weight: 300, points: 300 }))
+  const week = profile({ ...NO_SPEND, hours: friday, pointsSince: local(15, 22) }, at)
 
   // Every day seen at 10h: one Friday at 300, two weekend days and nothing else, 100; the one
   // weekday on record draws the weekdays only partway from that toward 300.
@@ -789,6 +790,44 @@ test('beside the check, how long what is left would last at this pace', () => {
 
   // The weekly window walks the person's week past the reset to say it: Thursday at 12h49.
   const week = { samples: [{ t: local(19, 20), used: 90 }], resetsAt: new Date(local(21, 23)).toISOString() }
-  const held = { ...NO_SPEND, hours: workWeek(19, 20), hoursSince: local(11, 23), perPoint: { seven_day: 100 } }
+  const held = { ...NO_SPEND, hours: workWeek(19, 20, 0.5), pointsSince: local(11, 23), perPoint: { seven_day: 100 } }
   expect(lasting('seven_day', week, local(19, 20), held)).toBe('dura ~2d16h')
+})
+
+test('the week is learned in points, so a point that weighs less now does not inflate it', () => {
+  // Last week a point took 300 of weight and this one 100: 150 of weight an hour was half a
+  // point then. Read by today's point it would be 1.5; the points the hours kept say 0.5.
+  const at = local(19, 20)
+  const then = workWeek(19, 20, 0.5).map(h => ({ ...h, weight: 150 }))
+  const week = profile({ ...NO_SPEND, hours: then, pointsSince: local(11, 23), perPoint: { seven_day: 100 } }, at)
+  expect(near(week?.weekday[10])).toBe(near(0.4583))
+
+  // Hours from before the points were kept teach nothing: no week until a day of them.
+  expect(profile({ ...NO_SPEND, hours: workWeek(19, 20).map(({ t, weight }) => ({ t, weight })), hoursSince: local(11, 23) }, at)).toBe(undefined)
+})
+
+test('a turn puts its points on its hour by the weight a point takes now', () => {
+  let held = { ...NO_SPEND, perPoint: { seven_day: 200 } }
+  held = spendTurn(held, START, usage(100))
+  held = spendTurn(held, START + MINUTE, usage(300))
+  expect(held.hours?.at(-1)?.points).toBe(2)
+  expect(held.pointsSince).toBe(START)
+
+  // No point known yet: weight alone, and nothing learned from it.
+  const early = spendTurn(NO_SPEND, START, usage(100))
+  expect(early.hours?.at(-1)?.points).toBe(undefined)
+  expect(early.pointsSince).toBe(undefined)
+})
+
+test('weighing the week again gives its hours the points the readings say', () => {
+  const reset = local(23, 18)
+  const window = { samples: [{ t: local(19, 9), used: 21 }], resetsAt: new Date(reset).toISOString() }
+  // 2100 spent since the week began on Friday 16 at 18h, over 21 points: 100 a point.
+  const own = [{ t: local(16, 17), weight: 500 }, { t: local(16, 20), weight: 1100, points: 0.1 }]
+  const home = { own: 0, events: [], hours: [{ t: local(18, 21), weight: 1000 }], since: local(15, 20) }
+  const held = { ...NO_SPEND, hours: own, hoursSince: local(15, 17), peers: { home }, perPoint: { seven_day: 37 } }
+
+  const weighed = calibrate(held, { seven_day: window }, local(19, 9))
+  expect(weighed.hours?.map(h => h.points)).toEqual([undefined, 11])
+  expect(weighed.pointsSince).toBe(local(16, 17))
 })

@@ -32,17 +32,21 @@ export type Spend = {
   hours?: Hourly[]
   // When the hours began: an hour after it with nothing on record is an hour not used.
   hoursSince?: number
+  // When the hours began to carry `points`: the forecast learns the week from these alone.
+  pointsSince?: number
 }
 
-// The weight of one hour's turns.
-export type Hourly = { t: number; weight: number }
+// The weight of one hour's turns, and the points of the weekly window it took, as the weight of
+// a point stood when it was spent. A point's weight moves (another model, another limit), so the
+// weight alone, read by today's point, says nothing of an hour of last week.
+export type Hourly = { t: number; weight: number; points?: number }
 
 // Another machine: the weight of its own turns, its last day of them, its hours, and since
-// when it counted those.
-export type Peer = { own: number; events: Spent[]; hours?: Hourly[]; since?: number }
+// when it counted those and their points.
+export type Peer = { own: number; events: Spent[]; hours?: Hourly[]; since?: number; pointsSince?: number }
 
 // What a machine sends the sync server, and what the server keeps of each.
-export type DeviceState = { own: number; events: Spent[]; windows: Windows; hours?: Hourly[]; since?: number }
+export type DeviceState = { own: number; events: Spent[]; windows: Windows; hours?: Hourly[]; since?: number; pointsSince?: number }
 
 declare module 'claude-code' {
   interface PluginState {
